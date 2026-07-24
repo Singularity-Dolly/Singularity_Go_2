@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -409,14 +408,6 @@ class RobotGatewayClient:
         """Publish a robot event to Dolly EventBus."""
         self._sequence += 1
         try:
-            from .contracts import EventEnvelope
-
-            envelope = EventEnvelope(
-                event_type=event_type,
-                source="robot_gateway",
-                sequence=self._sequence,
-                payload=payload,
-            )
             await self._bus.publish(
                 event_type=event_type,
                 source="robot_gateway",
