@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "singularity-go2-console"
+version = "0.1.0"
+description = "Standalone terminal-first Unitree Go2 control CLI (go2ctl)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Singularity Dolly" }]
+dependencies = [
+  "typer>=0.12",
+  "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+]
+textual = [
+  "textual>=0.80",
+]
+
+[project.scripts]
+go2ctl = "singularity_go2_console.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["singularity_go2_console*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

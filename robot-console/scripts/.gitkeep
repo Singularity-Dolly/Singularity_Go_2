@@ -1,0 +1,4 @@
+"""Shell wrappers — activate env and call go2ctl only."""
+
+from __future__ import annotations
+# Placeholder so scripts/ is tracked; real scripts are .sh files.
