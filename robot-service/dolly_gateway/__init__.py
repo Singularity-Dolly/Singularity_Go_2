@@ -34,6 +34,12 @@ from .frame_provider import FrameProvider
 from .command_queue import CommandExecutor, CommandQueue
 from .module import DollyGatewayModule, create_module
 
+# Lazy import — config requires pydantic-settings (optional on Linux)
+try:
+    from .config import GatewaySettings
+except ImportError:
+    GatewaySettings = None  # type: ignore[assignment,misc]
+
 __all__ = [
     # Contracts
     "CommandKind",
@@ -70,6 +76,8 @@ __all__ = [
     # Command queue
     "CommandExecutor",
     "CommandQueue",
+    # Config
+    "GatewaySettings",
     # Module
     "DollyGatewayModule",
     "create_module",

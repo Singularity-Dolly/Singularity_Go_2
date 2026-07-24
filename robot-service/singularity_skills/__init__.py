@@ -9,3 +9,11 @@ Skill name → CommandKind mapping:
     scan_start    → scan.start
     mission_stop  → mission.stop
 """
+
+from .skills import SingularitySkillContainer, SkillProtocol, skill
+
+__all__ = [
+    "SingularitySkillContainer",
+    "SkillProtocol",
+    "skill",
+]
