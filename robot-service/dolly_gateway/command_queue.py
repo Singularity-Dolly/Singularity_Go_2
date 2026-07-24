@@ -271,7 +271,7 @@ class CommandQueue:
                         request_id=item.command.request_id,
                         accepted=False,
                         reason=RejectionReason.ESTOP_ACTIVE.value,
-                        robot_mode=self.current_mode,
+                        robot_mode=self._current_mode,
                     )
                 )
         return receipts

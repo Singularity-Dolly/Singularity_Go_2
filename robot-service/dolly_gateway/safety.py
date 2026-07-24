@@ -135,7 +135,9 @@ class FrameGuard:
             return (time.monotonic() - self._latest_frame_ts) * 1000
 
     def update(self, jpeg_bytes: bytes) -> None:
-        """Store a new frame with current timestamp."""
+        """Store a new frame with current timestamp. Ignores empty bytes."""
+        if not jpeg_bytes:
+            return
         with self._lock:
             self._latest_frame = jpeg_bytes
             self._latest_frame_ts = time.monotonic()
