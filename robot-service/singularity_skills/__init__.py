@@ -1,0 +1,1 @@
+"""Custom @skill methods for Singularity Go2 blueprint."""
