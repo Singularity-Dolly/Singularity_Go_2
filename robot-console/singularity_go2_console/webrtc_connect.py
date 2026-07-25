@@ -278,30 +278,41 @@ class Go2WebRTCSession:
     def _publish_sport_request_nowait(
         self, api_name: str, parameter: dict[str, Any] | None = None
     ) -> None:
-        """Fire-and-forget sport request (Move/StopMove). Avoids UI freezes."""
-        from unitree_webrtc_connect.constants import DATA_CHANNEL_TYPE, RTC_TOPIC, SPORT_CMD
+        """Compatibility wrapper — schedules async sport publish on the session loop."""
+        self._run(self._async_publish_sport(api_name, parameter), timeout=2.0)
 
-        generated_id = int(time.time() * 1000) % 2147483648 + random.randint(0, 1000)
-        request_payload: dict[str, Any] = {
-            "header": {
-                "identity": {
-                    "id": generated_id,
-                    "api_id": SPORT_CMD[api_name],
-                }
-            },
-            "parameter": "",
-        }
+    async def _async_publish_sport(
+        self, api_name: str, parameter: dict[str, Any] | None = None
+    ) -> bool:
+        """Publish sport request via publish_request_new (same path as Unitree samples).
+
+        Waits briefly for an ACK; on timeout the datagram was still sent.
+        """
+        from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD
+
+        options: dict[str, Any] = {"api_id": SPORT_CMD[api_name]}
         if parameter is not None:
-            request_payload["parameter"] = (
-                parameter
-                if isinstance(parameter, str)
-                else json.dumps(parameter)
+            # Unitree ROS2 uses x/y/z; some WebRTC samples also accept yaw.
+            payload = dict(parameter)
+            if "z" in payload and "yaw" not in payload:
+                payload["yaw"] = payload["z"]
+            options["parameter"] = payload
+        try:
+            await asyncio.wait_for(
+                self.conn.datachannel.pub_sub.publish_request_new(
+                    RTC_TOPIC["SPORT_MOD"],
+                    options,
+                ),
+                timeout=0.5,
             )
-        self.conn.datachannel.pub_sub.publish_without_callback(
-            RTC_TOPIC["SPORT_MOD"],
-            data=request_payload,
-            msg_type=DATA_CHANNEL_TYPE["REQUEST"],
-        )
+            sent = True
+        except asyncio.TimeoutError:
+            # Request is sent before the waiter blocks; missing ACK is common at 20 Hz.
+            logger.debug("sport %s: no ACK within 0.5s (command likely sent)", api_name)
+            sent = True
+        except Exception:
+            logger.exception("sport %s publish failed", api_name)
+            sent = False
         self._record_sport(
             api_name,
             **(
@@ -314,6 +325,7 @@ class Go2WebRTCSession:
                 else {}
             ),
         )
+        return sent
 
     def get_motion_mode(self, *, use_cache: bool = True) -> tuple[str | None, str, str]:
         """Read-only motion mode query (MOTION_SWITCHER api_id 1001)."""
@@ -334,7 +346,7 @@ class Go2WebRTCSession:
                 "MOTION_MODE_SWITCH_DISABLED",
                 "Pass --allow-normal-mode-switch to enable operator mode switch",
             )
-        from unitree_webrtc_connect.constants import RTC_TOPIC
+        from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD
 
         # Unitree MotionSwitcher: release active mode, then select normal.
         try:
@@ -362,6 +374,21 @@ class Go2WebRTCSession:
         self._cached_motion_mode = None
         self._cached_motion_mode_at = None
 
+        # Operator-gated arming only (never on connect/preflight): BalanceStand so
+        # subsequent Move commands can walk instead of ignoring velocity.
+        try:
+            await asyncio.wait_for(
+                self.conn.datachannel.pub_sub.publish_request_new(
+                    RTC_TOPIC["SPORT_MOD"],
+                    {"api_id": SPORT_CMD["BalanceStand"]},
+                ),
+                timeout=2.0,
+            )
+            self._record_sport("BalanceStand")
+            await asyncio.sleep(1.0)
+        except Exception:  # noqa: BLE001
+            logger.warning("BalanceStand during arming failed", exc_info=True)
+
         deadline = time.monotonic() + self.mode_switch_timeout_s
         last_seen: str | None = None
         while time.monotonic() < deadline:
@@ -373,15 +400,22 @@ class Go2WebRTCSession:
                 continue
             last_seen = name
             if name == REQUIRED_MOTION_MODE:
-                return True, "OK", "motion mode is normal"
-            # Opaque CheckMode after explicit SelectMode — treat as ready.
+                return True, "OK", "motion mode is normal (BalanceStand armed)"
             if name is None and self._operator_selected_normal:
                 return (
                     True,
                     "OK",
-                    "SelectMode(normal) sent; CheckMode opaque — allowing Move",
+                    "SelectMode(normal)+BalanceStand sent; CheckMode opaque — Move armed",
                 )
             await asyncio.sleep(0.15)
+        # SelectMode was ACKed — allow Move even if CheckMode stayed noisy.
+        if self._operator_selected_normal:
+            return (
+                True,
+                "OK",
+                "SelectMode(normal)+BalanceStand armed "
+                f"(last_seen={last_seen!r})",
+            )
         return (
             False,
             "MOTION_MODE_NOT_NORMAL",
@@ -393,7 +427,7 @@ class Go2WebRTCSession:
         """Operator-gated switch to normal mode (disabled by default)."""
         try:
             ok, code, message = self._run(
-                self._async_switch_to_normal(), timeout=12.0
+                self._async_switch_to_normal(), timeout=15.0
             )
             self.last_error_code = None if ok else code
             self.last_error_message = "" if ok else message
@@ -404,9 +438,7 @@ class Go2WebRTCSession:
             return False, "INTERNAL_ERROR", str(exc)
 
     async def _async_stop_move(self) -> bool:
-        self._publish_sport_request_nowait("StopMove")
-        self._move_active = False
-        return True
+        return await self._async_publish_sport("StopMove")
 
     async def _async_move(self, vx: float, vy: float, wz: float) -> tuple[bool, str, str]:
         try:
@@ -438,10 +470,12 @@ class Go2WebRTCSession:
                 f"(raw={self.last_motion_raw!r})",
             )
 
-        self._publish_sport_request_nowait(
+        ok = await self._async_publish_sport(
             "Move",
             {"x": float(vx), "y": float(vy), "z": float(wz)},
         )
+        if not ok:
+            return False, "VELOCITY_CHANNEL_UNAVAILABLE", "sport Move publish failed"
         self._move_active = True
         return True, "OK", "sport Move published"
 

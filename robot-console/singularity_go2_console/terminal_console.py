@@ -352,6 +352,7 @@ class TerminalConsole:
             "  q/e     = strafe\n"
             "  x       = IDLE / stop\n"
             "  mode    = show motion mode\n"
+            "  stand   = BalanceStand (arm legs for walk)\n"
             "  space   = E-stop\n"
             "  i       = status\n"
             "  quit    = exit\n"
@@ -395,8 +396,19 @@ class TerminalConsole:
                         raw_val = getattr(raw, "last_motion_raw", None) if raw else None
                         print(f"motion_mode={name!r} code={code} {message}")
                         print(f"raw={raw_val!r}")
+                        sports = list(getattr(raw, "sport_requests", []) or [])[-5:]
+                        print(f"last_sport={sports!r}")
                     else:
                         print("motion mode query not available on this adapter")
+                elif cmd == "stand":
+                    session = getattr(self.controller.adapter, "_session", None)
+                    if session is None or not hasattr(session, "_run"):
+                        print("stand: no live session")
+                    else:
+                        ok = session._run(
+                            session._async_publish_sport("BalanceStand"), timeout=3.0
+                        )
+                        print(f"BalanceStand sent ok={ok}")
                 elif cmd == "i":
                     print((await self.controller.get_status()).to_dict())
                 elif cmd in MOTION_KEYS:
@@ -408,17 +420,25 @@ class TerminalConsole:
                         )
                         if not result.ok:
                             continue
+                    # Line-mode: longer deadman so one Enter produces visible steps.
+                    hold_s = max(self.key_hold_ms, 800) / 1000.0
                     self.note_motion_key(cmd)
-                    # Drain the hold window with teleop ticks (mock/tests/line mode).
+                    self._active_until = self._clock() + hold_s
                     while self.is_active:
                         await self.teleop_tick()
                         await self.controller.tick_watchdogs()
                         await asyncio.sleep(self._teleop_period_s)
                     await self.teleop_tick()
                     status = await self.controller.get_status()
+                    session = getattr(self.controller.adapter, "_session", None)
+                    last_sport = None
+                    if session is not None:
+                        reqs = getattr(session, "sport_requests", []) or []
+                        last_sport = reqs[-1] if reqs else None
                     print(
                         f"moved {cmd}: vx={status.vx:.3f} vy={status.vy:.3f} "
-                        f"wz={status.wz:.3f} err={status.last_error}"
+                        f"wz={status.wz:.3f} err={status.last_error} "
+                        f"sport={last_sport}"
                     )
                 elif cmd == "l":
                     self._show_logs = not self._show_logs
