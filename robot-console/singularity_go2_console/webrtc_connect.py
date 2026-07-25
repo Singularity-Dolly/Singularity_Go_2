@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import threading
 import time
 from typing import Any, Callable, Literal
@@ -160,7 +161,7 @@ class Go2WebRTCSession:
         conn: Any,
         *,
         allow_normal_mode_switch: bool = False,
-        motion_mode_cache_s: float = 1.0,
+        motion_mode_cache_s: float = 2.0,
         mode_switch_timeout_s: float = 5.0,
     ) -> None:
         self.conn = conn
@@ -258,14 +259,58 @@ class Go2WebRTCSession:
 
         from unitree_webrtc_connect.constants import RTC_TOPIC
 
-        response = await self.conn.datachannel.pub_sub.publish_request_new(
-            RTC_TOPIC["MOTION_SWITCHER"],
-            {"api_id": MOTION_SWITCHER_CHECK_MODE},
+        # Short timeout — a hung mode query must not freeze the console keyboard.
+        response = await asyncio.wait_for(
+            self.conn.datachannel.pub_sub.publish_request_new(
+                RTC_TOPIC["MOTION_SWITCHER"],
+                {"api_id": MOTION_SWITCHER_CHECK_MODE},
+            ),
+            timeout=1.0,
         )
         name = parse_motion_mode_name(response)
         self._cached_motion_mode = name
         self._cached_motion_mode_at = time.monotonic()
         return name
+
+    def _publish_sport_request_nowait(
+        self, api_name: str, parameter: dict[str, Any] | None = None
+    ) -> None:
+        """Fire-and-forget sport request (Move/StopMove). Avoids UI freezes."""
+        from unitree_webrtc_connect.constants import DATA_CHANNEL_TYPE, RTC_TOPIC, SPORT_CMD
+
+        generated_id = int(time.time() * 1000) % 2147483648 + random.randint(0, 1000)
+        request_payload: dict[str, Any] = {
+            "header": {
+                "identity": {
+                    "id": generated_id,
+                    "api_id": SPORT_CMD[api_name],
+                }
+            },
+            "parameter": "",
+        }
+        if parameter is not None:
+            request_payload["parameter"] = (
+                parameter
+                if isinstance(parameter, str)
+                else json.dumps(parameter)
+            )
+        self.conn.datachannel.pub_sub.publish_without_callback(
+            RTC_TOPIC["SPORT_MOD"],
+            data=request_payload,
+            msg_type=DATA_CHANNEL_TYPE["REQUEST"],
+        )
+        self._record_sport(
+            api_name,
+            **(
+                {
+                    "x": float(parameter.get("x", 0.0)),
+                    "y": float(parameter.get("y", 0.0)),
+                    "z": float(parameter.get("z", 0.0)),
+                }
+                if isinstance(parameter, dict)
+                else {}
+            ),
+        )
 
     def get_motion_mode(self, *, use_cache: bool = True) -> tuple[str | None, str, str]:
         """Read-only motion mode query (MOTION_SWITCHER api_id 1001)."""
@@ -310,7 +355,8 @@ class Go2WebRTCSession:
     def ensure_normal_mode(self) -> tuple[bool, str, str]:
         """Operator-gated switch to normal mode (disabled by default)."""
         try:
-            ok, code, message = self._run(self._async_switch_to_normal(), timeout=15.0)
+            # Keep this short so pressing M cannot freeze the console for long.
+            ok, code, message = self._run(self._async_switch_to_normal(), timeout=6.0)
             self.last_error_code = None if ok else code
             self.last_error_message = "" if ok else message
             return ok, code, message
@@ -320,17 +366,27 @@ class Go2WebRTCSession:
             return False, "INTERNAL_ERROR", str(exc)
 
     async def _async_stop_move(self) -> bool:
-        RTC_TOPIC, SPORT_CMD = _sport_constants()
-        await self.conn.datachannel.pub_sub.publish_request_new(
-            RTC_TOPIC["SPORT_MOD"],
-            {"api_id": SPORT_CMD["StopMove"]},
-        )
-        self._record_sport("StopMove")
+        self._publish_sport_request_nowait("StopMove")
         self._move_active = False
         return True
 
     async def _async_move(self, vx: float, vy: float, wz: float) -> tuple[bool, str, str]:
-        mode = await self._async_get_motion_mode(use_cache=True)
+        try:
+            mode = await self._async_get_motion_mode(use_cache=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("motion mode query failed: %s", exc)
+            mode = self._cached_motion_mode
+            if mode is None:
+                try:
+                    await self._async_stop_move()
+                except Exception:  # noqa: BLE001
+                    logger.exception("StopMove after mode-query failure failed")
+                return (
+                    False,
+                    "MOTION_MODE_NOT_NORMAL",
+                    f"motion mode query failed: {exc}",
+                )
+
         if mode != REQUIRED_MOTION_MODE:
             try:
                 await self._async_stop_move()
@@ -343,23 +399,19 @@ class Go2WebRTCSession:
                 "(no automatic mode switch)",
             )
 
-        RTC_TOPIC, SPORT_CMD = _sport_constants()
-        await self.conn.datachannel.pub_sub.publish_request_new(
-            RTC_TOPIC["SPORT_MOD"],
-            {
-                "api_id": SPORT_CMD["Move"],
-                "parameter": {"x": float(vx), "y": float(vy), "z": float(wz)},
-            },
+        self._publish_sport_request_nowait(
+            "Move",
+            {"x": float(vx), "y": float(vy), "z": float(wz)},
         )
-        self._record_sport("Move", x=float(vx), y=float(vy), z=float(wz))
         self._move_active = True
         return True, "OK", "sport Move published"
 
     def move(self, vx: float, vy: float, wz: float) -> bool:
         """Publish sport-mode Move (x=vx, y=vy, z=wz). Not wireless joystick."""
         try:
+            # Fire-and-forget Move + cached mode check — must stay fast for teleop UI.
             ok, code, message = self._run(
-                self._async_move(float(vx), float(vy), float(wz)), timeout=5.0
+                self._async_move(float(vx), float(vy), float(wz)), timeout=2.0
             )
             self.last_error_code = None if ok else code
             self.last_error_message = "" if ok else message
@@ -373,7 +425,7 @@ class Go2WebRTCSession:
     def stop_movement(self) -> bool:
         """Publish sport-mode StopMove once for this stop call."""
         try:
-            ok = self._run(self._async_stop_move(), timeout=5.0)
+            ok = self._run(self._async_stop_move(), timeout=2.0)
             self.last_error_code = None if ok else "VELOCITY_CHANNEL_UNAVAILABLE"
             self.last_error_message = "" if ok else "StopMove failed"
             return bool(ok)

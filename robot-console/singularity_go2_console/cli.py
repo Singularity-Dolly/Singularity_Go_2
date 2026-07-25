@@ -298,6 +298,7 @@ async def _start_session(
     cfg: Go2CtlConfig,
     *,
     open_console: bool,
+    line_mode: bool = False,
 ) -> int:
     console.print(SAFETY_WARNING)
     if not cfg.mock and cfg.connection_mode == "sta" and not cfg.robot_ip:
@@ -310,16 +311,22 @@ async def _start_session(
             console.print(f"[red]{exc}[/red]")
             return 2
 
+    console.print("[yellow]Connecting… (wait for connected=True)[/yellow]")
     controller = _build_controller(cfg)
     ip = cfg.robot_ip
     result = await controller.connect(ip)
     if not result.ok:
         console.print(f"[red]connect failed: {result.code.value} {result.message}[/red]")
         return 2
+    console.print(f"[green]connected[/green] mode={controller.mode.value}")
 
     mode = (cfg.start_mode or "follow").lower()
     if mode == "manual":
-        await controller.start_manual()
+        man = await controller.start_manual()
+        if not man.ok:
+            console.print(
+                f"[red]manual start failed: {man.code.value} {man.message}[/red]"
+            )
     elif mode == "follow":
         console.print(SAFETY_WARNING)
         await controller.start_follow_front_person()
@@ -331,7 +338,11 @@ async def _start_session(
     if open_console:
         from singularity_go2_console.terminal_console import run_console
 
-        return await run_console(controller, cfg)
+        return await run_console(
+            controller,
+            cfg,
+            force_line_mode=True if line_mode else None,
+        )
 
     await controller.shutdown()
     return 0
@@ -352,6 +363,11 @@ def start(
         "--allow-normal-mode-switch",
         help="Allow explicit switch to motion mode normal (disabled by default)",
     ),
+    line_mode: bool = typer.Option(
+        False,
+        "--line-mode",
+        help="Force line-mode console (type w+Enter). Use if keyboard does not work",
+    ),
 ) -> None:
     """Connect and enter the requested mode (default: automatic front-person follow)."""
     cfg = _load_config(
@@ -364,7 +380,11 @@ def start(
         aes_key_file=aes_key_file,
         allow_normal_mode_switch=allow_normal_mode_switch,
     )
-    raise typer.Exit(asyncio.run(_start_session(cfg, open_console=not no_console)))
+    raise typer.Exit(
+        asyncio.run(
+            _start_session(cfg, open_console=not no_console, line_mode=line_mode)
+        )
+    )
 
 
 @app.command(name="console")
@@ -379,6 +399,11 @@ def console_cmd(
         "--allow-normal-mode-switch",
         help="Allow explicit switch to motion mode normal (disabled by default)",
     ),
+    line_mode: bool = typer.Option(
+        False,
+        "--line-mode",
+        help="Force line-mode console (type w+Enter). Use if keyboard does not work",
+    ),
 ) -> None:
     """Interactive terminal console."""
     cfg = _load_config(
@@ -389,7 +414,9 @@ def console_cmd(
         aes_key_file=aes_key_file,
         allow_normal_mode_switch=allow_normal_mode_switch,
     )
-    raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
+    raise typer.Exit(
+        asyncio.run(_start_session(cfg, open_console=True, line_mode=line_mode))
+    )
 
 
 @app.command()
@@ -403,6 +430,11 @@ def manual(
         "--allow-normal-mode-switch",
         help="Allow explicit switch to motion mode normal (disabled by default)",
     ),
+    line_mode: bool = typer.Option(
+        False,
+        "--line-mode",
+        help="Force line-mode console (type w+Enter). Use if keyboard does not work",
+    ),
 ) -> None:
     """Start in manual teleop mode."""
     cfg = _load_config(
@@ -413,8 +445,9 @@ def manual(
         aes_key_file=aes_key_file,
         allow_normal_mode_switch=allow_normal_mode_switch,
     )
-    raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
-
+    raise typer.Exit(
+        asyncio.run(_start_session(cfg, open_console=True, line_mode=line_mode))
+    )
 
 @app.command()
 def follow(

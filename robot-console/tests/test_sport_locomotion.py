@@ -53,9 +53,12 @@ class FakePubSub:
         return {"ok": True}
 
     def publish_without_callback(self, topic: str, data: Any = None, msg_type: Any = None) -> None:
-        self.requests.append(
-            {"topic": topic, "wireless": data, "type": msg_type, "diagnostic": True}
-        )
+        entry: dict[str, Any] = {"topic": topic, "data": data, "type": msg_type}
+        # Only mark wireless diagnostic publishes; sport Move/StopMove use this too.
+        if topic == RTC_TOPIC["WIRELESS_CONTROLLER"]:
+            entry["wireless"] = data
+            entry["diagnostic"] = True
+        self.requests.append(entry)
 
 
 class FakeDataChannel:

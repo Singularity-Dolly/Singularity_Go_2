@@ -2,12 +2,17 @@
 
 WASD teleop uses a deadman hold window (GO2CTL_KEY_HOLD_MS) so a single key
 event keeps publishing at ~20 Hz until the deadline, then sends exactly one zero.
+
+On WSL / Cursor / VS Code terminals, curses often fails to capture keys — use
+--line-mode or GO2CTL_LINE_MODE=1 (type w + Enter).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 import time
 from typing import Any, Callable
 
@@ -40,6 +45,23 @@ def _try_import_curses() -> Any | None:
         return None
 
 
+def prefer_line_mode(*, force: bool | None = None) -> bool:
+    """Prefer line-mode when curses cannot reliably capture keyboard input."""
+    if force is not None:
+        return bool(force)
+    env = os.environ.get("GO2CTL_LINE_MODE", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    term = (os.environ.get("TERM") or "").strip().lower()
+    if term in {"", "dumb", "unknown"}:
+        return True
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return True
+    return False
+
+
 class TerminalConsole:
     def __init__(
         self,
@@ -47,10 +69,12 @@ class TerminalConsole:
         config: Go2CtlConfig,
         *,
         clock: Clock | None = None,
+        force_line_mode: bool | None = None,
     ) -> None:
         self.controller = controller
         self.config = config
         self._clock: Clock = clock or time.monotonic
+        self._force_line_mode = force_line_mode
         self._show_logs = False
         self._active_keys: set[str] = set()
         self._active_vx = 0.0
@@ -177,6 +201,12 @@ class TerminalConsole:
         await self.controller.shutdown()
 
     async def run(self) -> int:
+        if prefer_line_mode(force=self._force_line_mode):
+            logger.warning(
+                "Using line-mode console (curses keyboard capture unreliable). "
+                "Type commands then Enter: m, w, a, s, d, x, quit"
+            )
+            return await self._line_mode()
         curses = _try_import_curses()
         if curses is None:
             logger.warning("curses unavailable; using line mode")
@@ -315,8 +345,16 @@ class TerminalConsole:
         print(SAFETY_WARNING)
         print(HELP)
         print(
-            "Line mode: type commands: w/a/s/d/q/e, m, f, r, x, i, l, space, quit\n"
-            f"Deadman hold window: {self.key_hold_ms} ms @ {TELEOP_PUBLISH_HZ:.0f} Hz"
+            "\n=== LINE MODE (keyboard works here) ===\n"
+            "Type a command, then press Enter:\n"
+            "  m       = MANUAL (start driving)\n"
+            "  w/a/s/d = move (hold window ~400ms)\n"
+            "  q/e     = strafe\n"
+            "  x       = IDLE / stop\n"
+            "  space   = E-stop\n"
+            "  i       = status\n"
+            "  quit    = exit\n"
+            f"Deadman hold: {self.key_hold_ms} ms @ {TELEOP_PUBLISH_HZ:.0f} Hz\n"
         )
         try:
             while self._running:
@@ -324,31 +362,41 @@ class TerminalConsole:
                 await self.teleop_tick()
                 status = await self.controller.get_status()
                 print(
-                    f"[{status.mode}] owner={status.velocity_owner} "
-                    f"vx={status.vx:.2f} wz={status.wz:.2f} err={status.last_error}"
+                    f"[{status.mode}] connected={status.connected} "
+                    f"owner={status.velocity_owner} "
+                    f"vx={status.vx:.2f} wz={status.wz:.2f} "
+                    f"err={status.last_error}"
                 )
                 try:
                     line = await asyncio.to_thread(input, "> ")
                 except EOFError:
                     break
                 cmd = line.strip().lower()
-                if cmd in {"quit", "esc", "exit"}:
+                if cmd in {"quit", "esc", "exit", "q!"}:
                     break
                 if cmd in {"space", "estop"}:
                     await self.handle_estop("line")
                 elif cmd == "m":
-                    await self.controller.start_manual()
+                    result = await self.controller.start_manual()
+                    print(f"manual: ok={result.ok} code={result.code.value} {result.message}")
                 elif cmd == "f":
                     await self.controller.start_follow_front_person()
                 elif cmd == "r":
                     await self.controller.reacquire_front_person()
                 elif cmd == "x":
                     await self.handle_hold()
+                    print("hold -> IDLE")
                 elif cmd == "i":
                     print((await self.controller.get_status()).to_dict())
                 elif cmd in MOTION_KEYS:
                     if self.controller.mode != ControllerMode.MANUAL:
-                        await self.controller.start_manual()
+                        result = await self.controller.start_manual()
+                        print(
+                            f"auto manual: ok={result.ok} "
+                            f"code={result.code.value} {result.message}"
+                        )
+                        if not result.ok:
+                            continue
                     self.note_motion_key(cmd)
                     # Drain the hold window with teleop ticks (mock/tests/line mode).
                     while self.is_active:
@@ -356,14 +404,28 @@ class TerminalConsole:
                         await self.controller.tick_watchdogs()
                         await asyncio.sleep(self._teleop_period_s)
                     await self.teleop_tick()
+                    status = await self.controller.get_status()
+                    print(
+                        f"moved {cmd}: vx={status.vx:.3f} vy={status.vy:.3f} "
+                        f"wz={status.wz:.3f} err={status.last_error}"
+                    )
+                elif cmd == "l":
+                    self._show_logs = not self._show_logs
                 else:
-                    print("unknown command")
+                    print("unknown command — try: m, w, a, s, d, x, space, quit")
                 await asyncio.sleep(0.05)
         finally:
             await self.handle_shutdown()
         return 0
 
 
-async def run_console(controller: Go2Controller, config: Go2CtlConfig) -> int:
-    ui = TerminalConsole(controller, config)
+async def run_console(
+    controller: Go2Controller,
+    config: Go2CtlConfig,
+    *,
+    force_line_mode: bool | None = None,
+) -> int:
+    ui = TerminalConsole(
+        controller, config, force_line_mode=force_line_mode
+    )
     return await ui.run()
