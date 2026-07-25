@@ -246,10 +246,37 @@ class Go2Controller:
             return ControllerResult.failure(err, message)
         return ControllerResult.success(message=message)
 
+    def _maybe_arm_locomotion(self) -> None:
+        """Operator-gated normal mode + BalanceStand (via adapter.ensure_normal_mode)."""
+        if not getattr(self.config, "allow_normal_mode_switch", False):
+            return
+        ensure = getattr(self.adapter, "ensure_normal_mode", None)
+        if not callable(ensure):
+            return
+        ok, code, message = ensure()
+        if not ok:
+            logger.warning(
+                "locomotion arm incomplete: %s %s — continuing",
+                code,
+                message,
+            )
+            self._set_error(
+                ErrorCode[code]
+                if code in ErrorCode.__members__
+                else ErrorCode.MOTION_MODE_NOT_NORMAL,
+                message,
+            )
+        else:
+            self._last_error = None
+            self._last_error_code = None
+
     async def start_manual(self) -> ControllerResult:
         self._last_command = "manual.start"
         if self._estop:
             return ControllerResult.failure(ErrorCode.ESTOP_ACTIVE, "E-stop active")
+
+        self._maybe_arm_locomotion()
+
         result = await self._transition(
             ControllerMode.MANUAL,
             transfer_owner=VelocityOwner.MANUAL,
@@ -313,6 +340,9 @@ class Go2Controller:
         if self.config.detect_only or self.config.tracker_only:
             # Motion blocked in debug modes after acquisition
             pass
+
+        # Arm sport locomotion before acquire so follow can walk once locked.
+        self._maybe_arm_locomotion()
 
         result = await self._transition(
             ControllerMode.ACQUIRING_TARGET,
@@ -679,7 +709,7 @@ class Go2Controller:
                 if callable(pop):
                     cmd = pop()
                     if cmd is not None:
-                        vx, vy, wz = self.config.clamp_velocity(*cmd)
+                        vx, vy, wz = self.config.clamp_follow_velocity(*cmd)
                         self._mux.publish(VelocityOwner.FOLLOW, vx, vy, wz)
 
     async def shutdown(self) -> ControllerResult:

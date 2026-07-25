@@ -45,6 +45,7 @@ def _load_config(
     tracker_only: bool = False,
     connection_mode: Optional[str] = None,
     aes_key_file: Optional[str] = None,
+    allow_normal_mode_switch: Optional[bool] = None,
 ) -> Go2CtlConfig:
     cfg = Go2CtlConfig.from_environ(load_aes=True, require_aes=False)
     overrides = {
@@ -60,10 +61,14 @@ def _load_config(
         overrides["aes_key_file"] = aes_key_file
         from singularity_go2_console.aes import load_aes_key
         overrides["aes_key"] = load_aes_key(key_file=aes_key_file)
+    if allow_normal_mode_switch is not None:
+        overrides["allow_normal_mode_switch"] = allow_normal_mode_switch
     return cfg.with_overrides(**overrides)
 
 
-def _build_controller(cfg: Go2CtlConfig) -> Go2Controller:
+def _build_controller(
+    cfg: Go2CtlConfig, *, enable_video: bool = True
+) -> Go2Controller:
     if cfg.mock:
         from singularity_go2_console.testing.fakes import FakeGo2Adapter
 
@@ -76,6 +81,8 @@ def _build_controller(cfg: Go2CtlConfig) -> Go2Controller:
         detection_confidence=cfg.detection_confidence,
         connection_mode=cfg.connection_mode,
         aes_key=cfg.aes_key.value if cfg.aes_key else None,
+        allow_normal_mode_switch=cfg.allow_normal_mode_switch,
+        enable_video=enable_video,
     )
     if adapter.mock:
         raise RuntimeError("Refusing mock adapter in real mode")
@@ -294,6 +301,7 @@ async def _start_session(
     cfg: Go2CtlConfig,
     *,
     open_console: bool,
+    line_mode: bool = False,
 ) -> int:
     console.print(SAFETY_WARNING)
     if not cfg.mock and cfg.connection_mode == "sta" and not cfg.robot_ip:
@@ -306,16 +314,24 @@ async def _start_session(
             console.print(f"[red]{exc}[/red]")
             return 2
 
-    controller = _build_controller(cfg)
+    console.print("[yellow]Connecting… (wait for connected=True)[/yellow]")
+    # Console/manual teleop does not need camera/detector downloads.
+    want_video = (cfg.start_mode or "").lower() == "follow"
+    controller = _build_controller(cfg, enable_video=want_video)
     ip = cfg.robot_ip
     result = await controller.connect(ip)
     if not result.ok:
         console.print(f"[red]connect failed: {result.code.value} {result.message}[/red]")
         return 2
+    console.print(f"[green]connected[/green] mode={controller.mode.value}")
 
     mode = (cfg.start_mode or "follow").lower()
     if mode == "manual":
-        await controller.start_manual()
+        man = await controller.start_manual()
+        if not man.ok:
+            console.print(
+                f"[red]manual start failed: {man.code.value} {man.message}[/red]"
+            )
     elif mode == "follow":
         console.print(SAFETY_WARNING)
         await controller.start_follow_front_person()
@@ -327,7 +343,11 @@ async def _start_session(
     if open_console:
         from singularity_go2_console.terminal_console import run_console
 
-        return await run_console(controller, cfg)
+        return await run_console(
+            controller,
+            cfg,
+            force_line_mode=True if line_mode else None,
+        )
 
     await controller.shutdown()
     return 0
@@ -343,6 +363,16 @@ def start(
     detect_only: bool = typer.Option(False, "--detect-only"),
     tracker_only: bool = typer.Option(False, "--tracker-only"),
     no_console: bool = typer.Option(False, "--no-console"),
+    allow_normal_mode_switch: bool = typer.Option(
+        False,
+        "--allow-normal-mode-switch",
+        help="Allow explicit switch to motion mode normal (disabled by default)",
+    ),
+    line_mode: bool = typer.Option(
+        False,
+        "--line-mode",
+        help="Force line-mode console (type w+Enter). Use if keyboard does not work",
+    ),
 ) -> None:
     """Connect and enter the requested mode (default: automatic front-person follow)."""
     cfg = _load_config(
@@ -353,8 +383,13 @@ def start(
         tracker_only=tracker_only,
         connection_mode=connection_mode,
         aes_key_file=aes_key_file,
+        allow_normal_mode_switch=allow_normal_mode_switch,
     )
-    raise typer.Exit(asyncio.run(_start_session(cfg, open_console=not no_console)))
+    raise typer.Exit(
+        asyncio.run(
+            _start_session(cfg, open_console=not no_console, line_mode=line_mode)
+        )
+    )
 
 
 @app.command(name="console")
@@ -364,6 +399,16 @@ def console_cmd(
     aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file"),
     mode: str = typer.Option("manual", "--mode"),
     mock: bool = typer.Option(False, "--mock"),
+    allow_normal_mode_switch: bool = typer.Option(
+        False,
+        "--allow-normal-mode-switch",
+        help="Allow explicit switch to motion mode normal (disabled by default)",
+    ),
+    line_mode: bool = typer.Option(
+        False,
+        "--line-mode",
+        help="Force line-mode console (type w+Enter). Use if keyboard does not work",
+    ),
 ) -> None:
     """Interactive terminal console."""
     cfg = _load_config(
@@ -372,8 +417,11 @@ def console_cmd(
         mock=mock,
         connection_mode=connection_mode,
         aes_key_file=aes_key_file,
+        allow_normal_mode_switch=allow_normal_mode_switch,
     )
-    raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
+    raise typer.Exit(
+        asyncio.run(_start_session(cfg, open_console=True, line_mode=line_mode))
+    )
 
 
 @app.command()
@@ -382,6 +430,16 @@ def manual(
     connection_mode: str = typer.Option("ap", "--connection-mode", help="ap|sta"),
     aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file"),
     mock: bool = typer.Option(False, "--mock"),
+    allow_normal_mode_switch: bool = typer.Option(
+        False,
+        "--allow-normal-mode-switch",
+        help="Allow explicit switch to motion mode normal (disabled by default)",
+    ),
+    line_mode: bool = typer.Option(
+        False,
+        "--line-mode",
+        help="Force line-mode console (type w+Enter). Use if keyboard does not work",
+    ),
 ) -> None:
     """Start in manual teleop mode."""
     cfg = _load_config(
@@ -390,9 +448,11 @@ def manual(
         mock=mock,
         connection_mode=connection_mode,
         aes_key_file=aes_key_file,
+        allow_normal_mode_switch=allow_normal_mode_switch,
     )
-    raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
-
+    raise typer.Exit(
+        asyncio.run(_start_session(cfg, open_console=True, line_mode=line_mode))
+    )
 
 @app.command()
 def follow(
@@ -400,16 +460,60 @@ def follow(
     connection_mode: str = typer.Option("ap", "--connection-mode", help="ap|sta"),
     aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file"),
     mock: bool = typer.Option(False, "--mock"),
+    allow_normal_mode_switch: bool = typer.Option(
+        True,
+        "--allow-normal-mode-switch/--no-allow-normal-mode-switch",
+        help="Arm normal mode + BalanceStand before follow (default: on)",
+    ),
+    line_mode: bool = typer.Option(
+        False,
+        "--line-mode",
+        help="Force line-mode console UI",
+    ),
 ) -> None:
-    """Start automatic front-person follow."""
+    """Start automatic front-person follow (local YOLO + EdgeTAM AI)."""
+    console.print(SAFETY_WARNING)
+    console.print(
+        "Follow pipeline: camera → YOLO person → face aim (YuNet) → smooth walk.\n"
+        "Stand ~1.5m in front. Walk → soft follow. Stop → robot stops.\n"
+        "SPACE = E-stop. ESC = quit."
+    )
     cfg = _load_config(
         robot_ip=robot_ip,
         mode="follow",
         mock=mock,
         connection_mode=connection_mode,
         aes_key_file=aes_key_file,
+        allow_normal_mode_switch=allow_normal_mode_switch,
     )
-    raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
+    raise typer.Exit(
+        asyncio.run(_start_session(cfg, open_console=True, line_mode=line_mode))
+    )
+
+
+@app.command()
+def wasd(
+    aes_key_file: Optional[str] = typer.Option(
+        str(Path.home() / ".config/go2ctl/aes_key"),
+        "--aes-key-file",
+    ),
+) -> None:
+    """Minimal WASD walker (AP). No follow/detector — just walk."""
+    console.print(SAFETY_WARNING)
+    console.print(
+        "Launching minimal walker…\n"
+        "After BalanceStand, type w/a/s/d + Enter."
+    )
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "go2_wasd.py"
+    )
+    # Re-exec so the script owns the asyncio loop cleanly.
+    os.environ["GO2CTL_AES_KEY_FILE"] = aes_key_file or ""
+    raise typer.Exit(
+        subprocess.call(  # noqa: S603
+            [sys.executable, str(script)],
+        )
+    )
 
 
 @app.command()

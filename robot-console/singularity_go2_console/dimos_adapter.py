@@ -24,7 +24,13 @@ import time
 from typing import Any
 
 from singularity_go2_console.adapter_protocol import FollowInit
-from singularity_go2_console.front_person import CameraFrame, PersonDetection
+from singularity_go2_console.face_tracker import FaceTracker
+from singularity_go2_console.front_person import CameraFrame, PersonDetection, bbox_area
+from singularity_go2_console.yolo_follow_control import (
+    YoloFollowParams,
+    YoloFollowState,
+    compute_yolo_follow_cmd,
+)
 
 logger = logging.getLogger("go2ctl.dimos_adapter")
 
@@ -58,6 +64,8 @@ class DimOSGo2Adapter:
         control_hz: float = 20.0,
         connection_mode: str = "ap",
         aes_key: str | None = None,
+        allow_normal_mode_switch: bool = False,
+        enable_video: bool = True,
     ) -> None:
         self._detector_model = detector_model
         self._detection_confidence = detection_confidence
@@ -69,6 +77,8 @@ class DimOSGo2Adapter:
             raise ValueError("connection_mode must be ap or sta")
         self._connection_mode = mode
         self._aes_key = aes_key
+        self._allow_normal_mode_switch = bool(allow_normal_mode_switch)
+        self._enable_video = bool(enable_video)
 
         self._connected = False
         self._robot_ip: str | None = None
@@ -89,6 +99,12 @@ class DimOSGo2Adapter:
         self._cmd_bridge: Any | None = None  # optional intercept for injected skill
         self._warned_compat = False
         self._published_commands: list[tuple[float, float, float]] = []
+        self.last_velocity_error_code: str | None = None
+        self.last_velocity_error_message: str = ""
+        self._yolo_follow_state = YoloFollowState()
+        self._yolo_follow_params = YoloFollowParams()
+        self._face_tracker: FaceTracker | None = None
+        self._follow_lock_bbox: tuple[float, float, float, float] | None = None
 
     @property
     def mock(self) -> bool:
@@ -141,7 +157,9 @@ class DimOSGo2Adapter:
             return False, code, redact_secrets(message, secrets)
 
         ok, code, session, message = await start_connection(
-            connection, connection_mode=self._connection_mode  # type: ignore[arg-type]
+            connection,
+            connection_mode=self._connection_mode,  # type: ignore[arg-type]
+            allow_normal_mode_switch=self._allow_normal_mode_switch,
         )
         if not ok or session is None:
             return False, code, redact_secrets(message, secrets)
@@ -156,20 +174,40 @@ class DimOSGo2Adapter:
         self._connected = True
         self._published_commands = []
 
-        if not session.enable_video(self._on_av_frame):
-            logger.warning("Video channel enable failed at connect")
+        if self._enable_video:
+            if not session.enable_video(self._on_av_frame):
+                logger.warning("Video channel enable failed at connect")
+        else:
+            logger.info("Video disabled for this session (teleop/console)")
 
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and self._latest_frame is None:
-            await asyncio.sleep(0.05)
+        if self._enable_video:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and self._latest_frame is None:
+                await asyncio.sleep(0.05)
 
-        if self._latest_frame is None:
-            logger.warning("Connected but no camera frame yet")
+            if self._latest_frame is None:
+                logger.warning("Connected but no camera frame yet")
+        else:
+            # Synthetic frame so preflight/status paths that expect a frame stay calm.
+            self._frame_counter += 1
+            self._latest_frame = CameraFrame(
+                image=[[[0, 0, 0]]],
+                timestamp_s=time.monotonic(),
+                frame_id=self._frame_counter,
+                encoding="rgb",
+                width=1,
+                height=1,
+            )
 
         # Never auto-standup here — preflight and connect must remain no-motion.
-        det_ok = self._init_detector()
-        if not det_ok:
-            logger.warning("Detector not ready; follow acquisition will fail until available")
+        if self._enable_video:
+            det_ok = self._init_detector()
+            if not det_ok:
+                logger.warning(
+                    "Detector not ready; follow acquisition will fail until available"
+                )
+        else:
+            logger.info("Skipping detector init (teleop session without video)")
 
         mode_label = "LocalAP" if self._connection_mode == "ap" else "LocalSTA"
         return True, "OK", f"Connected via {mode_label} (AES authenticated)"
@@ -317,13 +355,23 @@ class DimOSGo2Adapter:
 
             zero_ok = self.publish_zero()
             stop_ok = bool(self._session and self._session.stop_movement())
+            sport_requests = list(getattr(self._session, "sport_requests", []) or [])
             out["zero_velocity"] = zero_ok
             out["stop_path"] = stop_ok
             out["commands"] = list(self._published_commands)
+            out["sport_requests"] = sport_requests
+            out["move_sent"] = any(
+                str(item.get("api")) == "Move" for item in sport_requests
+            )
             out["nonzero_velocity_sent"] = any(
                 abs(vx) > 1e-12 or abs(vy) > 1e-12 or abs(wz) > 1e-12
                 for vx, vy, wz in self._published_commands
             )
+            if out["move_sent"]:
+                out["ok"] = False
+                out["error_code"] = "INTERNAL_ERROR"
+                out["message"] = "preflight sent sport Move — abort"
+                return out
             if out["nonzero_velocity_sent"]:
                 out["ok"] = False
                 out["error_code"] = "INTERNAL_ERROR"
@@ -428,16 +476,58 @@ class DimOSGo2Adapter:
 
     def publish_velocity(self, vx: float, vy: float, wz: float) -> bool:
         if self._session is None:
+            self.last_velocity_error_code = "VELOCITY_OUTPUT_NOT_READY"
+            self.last_velocity_error_message = "session not connected"
             return False
-        self._published_commands.append((float(vx), float(vy), float(wz)))
-        return bool(self._session.move(vx, vy, wz))
+        ok = bool(self._session.move(vx, vy, wz))
+        if ok:
+            self._published_commands.append((float(vx), float(vy), float(wz)))
+            self.last_velocity_error_code = None
+            self.last_velocity_error_message = ""
+            return True
+        self.last_velocity_error_code = getattr(
+            self._session, "last_error_code", "VELOCITY_OUTPUT_NOT_READY"
+        )
+        self.last_velocity_error_message = getattr(
+            self._session, "last_error_message", "Move failed"
+        )
+        return False
 
     def publish_zero(self) -> bool:
         if self._session is None:
+            self.last_velocity_error_code = "VELOCITY_OUTPUT_NOT_READY"
+            self.last_velocity_error_message = "session not connected"
             return False
+        ok = bool(self._session.stop_movement())
         self._published_commands.append((0.0, 0.0, 0.0))
-        return bool(self._session.stop_movement())
+        if ok:
+            self.last_velocity_error_code = None
+            self.last_velocity_error_message = ""
+        else:
+            self.last_velocity_error_code = getattr(
+                self._session, "last_error_code", "VELOCITY_OUTPUT_NOT_READY"
+            )
+            self.last_velocity_error_message = getattr(
+                self._session, "last_error_message", "StopMove failed"
+            )
+        return ok
 
+    def ensure_normal_mode(self) -> tuple[bool, str, str]:
+        """Operator-gated switch to motion mode normal (disabled unless configured)."""
+        if not self._allow_normal_mode_switch:
+            return (
+                False,
+                "MOTION_MODE_SWITCH_DISABLED",
+                "Pass --allow-normal-mode-switch to enable operator mode switch",
+            )
+        if self._session is None:
+            return False, "VELOCITY_OUTPUT_NOT_READY", "session not connected"
+        return self._session.ensure_normal_mode()
+
+    def get_motion_mode(self) -> tuple[str | None, str, str]:
+        if self._session is None:
+            return None, "VELOCITY_OUTPUT_NOT_READY", "session not connected"
+        return self._session.get_motion_mode(use_cache=False)
 
     def encode_frame_jpeg_bytes(self, frame: CameraFrame) -> bytes | None:
         try:
@@ -509,42 +599,29 @@ class DimOSGo2Adapter:
             )
             self._warned_compat = True
 
+        edge_err: str | None = None
         try:
             from dimos.models.segmentation.edge_tam import EdgeTAMProcessor
             from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
             from dimos.navigation.visual_servoing.visual_servoing_2d import VisualServoing2D
-        except Exception as exc:  # noqa: BLE001
-            return False, "FOLLOW_SKILL_NOT_READY", f"Cannot import DimOS follow stack: {exc}"
 
-        self.stop_follow()
-        try:
+            self.stop_follow()
             import numpy as np
 
             tracker = EdgeTAMProcessor()
-            # Build Image for EdgeTAM
             image_obj = self._as_dimos_image(init.frame)
             box = np.array(init.bbox, dtype=np.float32)
             detections = tracker.init_track(image=image_obj, box=box, obj_id=1)
             if detections is None or len(detections) == 0:
-                self.publish_zero()
-                return False, "TRACKER_INIT_FAILED", "EdgeTAM failed to segment front person"
+                raise RuntimeError("EdgeTAM failed to segment front person")
 
-            try:
-                camera_info = CameraInfo.from_yaml(
-                    str(
-                        __import__("importlib.resources", fromlist=["files"]).files(
-                            "dimos.robot.unitree.go2"
-                        ).joinpath("front_camera_720.yaml")
-                    )
+            camera_info = CameraInfo.from_yaml(
+                str(
+                    __import__("importlib.resources", fromlist=["files"]).files(
+                        "dimos.robot.unitree.go2"
+                    ).joinpath("front_camera_720.yaml")
                 )
-            except Exception as exc:  # noqa: BLE001
-                self.publish_zero()
-                return (
-                    False,
-                    "FOLLOW_SKILL_NOT_READY",
-                    f"CameraInfo unavailable for VisualServoing2D: {exc}",
-                )
-
+            )
             self._visual_servo = VisualServoing2D(camera_info, False)
             self._tracker = tracker
             self._follow_stop.clear()
@@ -558,8 +635,144 @@ class DimOSGo2Adapter:
             self._follow_thread.start()
             return True, "OK", "EdgeTAM follow started"
         except Exception as exc:  # noqa: BLE001
+            edge_err = str(exc)
+            logger.warning(
+                "EdgeTAM follow unavailable (%s) — using YOLO bbox follow fallback",
+                edge_err,
+            )
+
+        # CPU-friendly fallback: re-detect person each frame and servo on bbox.
+        return self._start_yolo_bbox_follow(init, edge_err=edge_err)
+
+    def _start_yolo_bbox_follow(
+        self, init: FollowInit, *, edge_err: str | None = None
+    ) -> tuple[bool, str, str]:
+        if not self.detector_ready:
             self.publish_zero()
-            return False, "TRACKER_INIT_FAILED", str(exc)
+            return (
+                False,
+                "FOLLOW_SKILL_NOT_READY",
+                f"EdgeTAM failed ({edge_err}) and detector not ready for YOLO fallback",
+            )
+        self.stop_follow()
+        self._follow_stop.clear()
+        self._following = True
+        self._target_visible = True
+        self._visual_servo = None
+        self._tracker = None
+        self._follow_lock_bbox = tuple(float(x) for x in init.bbox)  # type: ignore[assignment]
+        if self._face_tracker is None:
+            self._face_tracker = FaceTracker()
+        width = int(init.frame.width or 640)
+        height = int(init.frame.height or 480)
+        self._follow_thread = threading.Thread(
+            target=self._yolo_follow_loop,
+            args=(width, height),
+            daemon=True,
+        )
+        self._follow_thread.start()
+        face_note = "face+head" if self._face_tracker.ready else "head-proxy"
+        msg = f"Smooth YOLO follow started ({face_note} aim)"
+        if edge_err:
+            msg += f" (EdgeTAM fallback: {edge_err})"
+        return True, "OK", msg
+
+    @staticmethod
+    def _iou(
+        a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+    ) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0.0:
+            return 0.0
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def _pick_locked_person(
+        self, dets: list[PersonDetection]
+    ) -> PersonDetection | None:
+        if not dets:
+            return None
+        lock = self._follow_lock_bbox
+        if lock is None:
+            best = max(dets, key=lambda d: bbox_area(d.bbox))
+            self._follow_lock_bbox = best.bbox
+            return best
+        scored = [(self._iou(lock, d.bbox), d) for d in dets]
+        scored.sort(key=lambda t: t[0], reverse=True)
+        iou, best = scored[0]
+        if iou >= 0.15:
+            # Soft lock update (EMA-like blend) to avoid box jumps.
+            lx1, ly1, lx2, ly2 = lock
+            bx1, by1, bx2, by2 = best.bbox
+            a = 0.35
+            self._follow_lock_bbox = (
+                (1 - a) * lx1 + a * bx1,
+                (1 - a) * ly1 + a * by1,
+                (1 - a) * lx2 + a * bx2,
+                (1 - a) * ly2 + a * by2,
+            )
+            return best
+        # Lost lock — retarget largest centered-ish person.
+        best = max(dets, key=lambda d: bbox_area(d.bbox))
+        self._follow_lock_bbox = best.bbox
+        return best
+
+    def _yolo_follow_loop(self, image_width: int, image_height: int) -> None:
+        """Smooth person follow: face aim + body range + slew limits."""
+        period = 1.0 / self._control_hz
+        lost = 0
+        self._yolo_follow_state = YoloFollowState()
+        face = self._face_tracker or FaceTracker()
+        self._face_tracker = face
+        while not self._follow_stop.is_set():
+            t0 = time.monotonic()
+            frame = self.get_latest_frame()
+            if frame is None or not self.detector_ready:
+                self._last_follow_cmd = (0.0, 0.0, 0.0)
+                lost += 1
+            else:
+                try:
+                    dets = self.detect_persons(frame)
+                    person = self._pick_locked_person(dets)
+                    if person is None:
+                        self._last_follow_cmd = (0.0, 0.0, 0.0)
+                        self._target_visible = False
+                        lost += 1
+                        if lost > self._max_lost_frames:
+                            break
+                    else:
+                        lost = 0
+                        self._target_visible = True
+                        aim_bbox, _src = face.aim_bbox(frame.image, person.bbox)
+                        self._last_follow_cmd = compute_yolo_follow_cmd(
+                            person.bbox,
+                            image_width,
+                            image_height,
+                            time.monotonic(),
+                            self._yolo_follow_state,
+                            self._yolo_follow_params,
+                            aim_bbox=aim_bbox,
+                        )
+                except Exception:
+                    logger.exception("yolo follow loop error")
+                    self._last_follow_cmd = (0.0, 0.0, 0.0)
+                    lost += 1
+                    if lost > self._max_lost_frames:
+                        break
+            elapsed = time.monotonic() - t0
+            time.sleep(max(0.0, period - elapsed))
+
+        self._last_follow_cmd = (0.0, 0.0, 0.0)
+        self._following = False
+        self._target_visible = False
+        self._follow_lock_bbox = None
 
     def _as_dimos_image(self, frame: CameraFrame) -> Any:
         try:

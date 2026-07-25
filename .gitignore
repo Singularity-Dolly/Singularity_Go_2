@@ -29,3 +29,8 @@ robot-service.env
 .go2ctl-logs/
 .dimos-logs/
 .secrets/
+
+# Downloaded ML weights (use robot-console/scripts/download_yolo.sh)
+*.pt
+weights/
+yolov8n.pt

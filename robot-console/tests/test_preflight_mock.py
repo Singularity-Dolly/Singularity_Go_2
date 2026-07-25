@@ -16,13 +16,16 @@ class _FakeSession:
         self.velocity_channel_ok = True
         self.closed = False
         self.moves: list[tuple[float, float, float]] = []
+        self.sport_requests: list[dict[str, Any]] = []
 
     def move(self, vx: float, vy: float, wz: float) -> bool:
         self.moves.append((vx, vy, wz))
+        self.sport_requests.append({"api": "Move", "x": vx, "y": vy, "z": wz})
         return True
 
     def stop_movement(self) -> bool:
         self.moves.append((0.0, 0.0, 0.0))
+        self.sport_requests.append({"api": "StopMove"})
         return True
 
     def close(self) -> None:

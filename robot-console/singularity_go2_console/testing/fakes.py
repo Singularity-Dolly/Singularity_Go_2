@@ -25,16 +25,24 @@ class FakeClock:
 class FakeVelocitySink:
     def __init__(self) -> None:
         self.commands: list[tuple[float, float, float]] = []
+        self.sport_requests: list[dict[str, Any]] = []
         self.fail = False
 
     def publish_velocity(self, vx: float, vy: float, wz: float) -> bool:
         if self.fail:
             return False
         self.commands.append((vx, vy, wz))
+        self.sport_requests.append(
+            {"api": "Move", "api_id": 1008, "x": float(vx), "y": float(vy), "z": float(wz)}
+        )
         return True
 
     def publish_zero(self) -> bool:
-        return self.publish_velocity(0.0, 0.0, 0.0)
+        if self.fail:
+            return False
+        self.commands.append((0.0, 0.0, 0.0))
+        self.sport_requests.append({"api": "StopMove", "api_id": 1003})
+        return True
 
     @property
     def last(self) -> tuple[float, float, float] | None:
@@ -134,6 +142,11 @@ class FakeGo2Adapter:
     clock: FakeClock = field(default_factory=FakeClock)
     fail_connect: bool = False
     drop_connection: bool = False
+    motion_mode: str = "normal"
+    allow_normal_mode_switch: bool = False
+    mode_switch_calls: int = 0
+    last_velocity_error_code: str | None = None
+    last_velocity_error_message: str = ""
     _connected: bool = False
     _robot_ip: str | None = None
 
@@ -167,6 +180,10 @@ class FakeGo2Adapter:
     def follow_ready(self) -> bool:
         return self.connected
 
+    @property
+    def sport_requests(self) -> list[dict[str, Any]]:
+        return self.sink.sport_requests
+
     async def connect(self, robot_ip: str | None = None) -> tuple[bool, str, str]:
         if self.fail_connect:
             return False, "WEBRTC_CONNECTION_FAILED", "fake connect failed"
@@ -183,11 +200,6 @@ class FakeGo2Adapter:
     def encode_frame_jpeg_bytes(self, frame: CameraFrame) -> bytes | None:
         return b"\xff\xd8\xff\xd9"
 
-    def encode_frame_jpeg_b64(self, frame: CameraFrame) -> str:
-        import base64
-        data = self.encode_frame_jpeg_bytes(frame) or b""
-        return base64.b64encode(data).decode("ascii")
-
     def get_latest_frame(self) -> CameraFrame | None:
         if not self.connected:
             return None
@@ -198,14 +210,39 @@ class FakeGo2Adapter:
 
     def publish_velocity(self, vx: float, vy: float, wz: float) -> bool:
         if not self.connected:
+            self.last_velocity_error_code = "VELOCITY_OUTPUT_NOT_READY"
+            self.last_velocity_error_message = "not connected"
             return False
+        if self.motion_mode != "normal":
+            self.sink.sport_requests.append({"api": "StopMove", "api_id": 1003})
+            self.last_velocity_error_code = "MOTION_MODE_NOT_NORMAL"
+            self.last_velocity_error_message = (
+                f"motion mode is {self.motion_mode!r}; require 'normal'"
+            )
+            return False
+        self.last_velocity_error_code = None
+        self.last_velocity_error_message = ""
         return self.sink.publish_velocity(vx, vy, wz)
 
     def publish_zero(self) -> bool:
-        if not self.connected:
-            # Still attempt record for tests of shutdown paths
-            return self.sink.publish_zero()
+        # Still attempt record for tests of shutdown paths
+        self.last_velocity_error_code = None
+        self.last_velocity_error_message = ""
         return self.sink.publish_zero()
+
+    def ensure_normal_mode(self) -> tuple[bool, str, str]:
+        self.mode_switch_calls += 1
+        if not self.allow_normal_mode_switch:
+            return (
+                False,
+                "MOTION_MODE_SWITCH_DISABLED",
+                "Pass --allow-normal-mode-switch to enable operator mode switch",
+            )
+        self.motion_mode = "normal"
+        return True, "OK", "motion mode is normal"
+
+    def get_motion_mode(self) -> tuple[str | None, str, str]:
+        return self.motion_mode, "OK", f"motion mode={self.motion_mode}"
 
     def start_follow(self, init: FollowInit) -> tuple[bool, str, str]:
         if not self.connected:
@@ -226,6 +263,7 @@ class FakeGo2Adapter:
             "robot_ip": self._robot_ip,
             "connected": self.connected,
             "mock": True,
+            "motion_mode": self.motion_mode,
         }
 
     @staticmethod

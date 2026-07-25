@@ -249,6 +249,7 @@ def _build_controller(config: Go2CtlConfig) -> Go2Controller:
         detection_confidence=config.detection_confidence,
         connection_mode=config.connection_mode,
         aes_key=config.aes_key.value if config.aes_key else None,
+        allow_normal_mode_switch=config.allow_normal_mode_switch,
     )
     return Go2Controller(adapter, config, allow_mock=False)
 
