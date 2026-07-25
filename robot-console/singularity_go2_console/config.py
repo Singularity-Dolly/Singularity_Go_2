@@ -11,12 +11,13 @@ from singularity_go2_console.aes import AesKeyError, AesKeyMaterial, load_aes_ke
 
 ConnectionMode = Literal["ap", "sta"]
 
-# Hard safety caps for AdventureX physical demo (manual teleop).
-MAX_LINEAR_MPS = 0.15
-MAX_YAW_RPS = 0.35
-# Follow may match ordinary walk pace (still below jog).
-FOLLOW_MAX_LINEAR_MPS = 0.45
-FOLLOW_MAX_YAW_RPS = 0.55
+# Hard safety caps. Go2 sport-mode physical limits ~3.0 m/s linear, ~2.5 rad/s yaw.
+# We leave ~0.5 m/s and ~0.5 rad/s safety margin to avoid tipping on slick floors.
+MAX_LINEAR_MPS = 2.5
+MAX_YAW_RPS = 2.0
+# Follow matches a brisk walk / light jog; still well below Go2 sport ceiling.
+FOLLOW_MAX_LINEAR_MPS = 2.0
+FOLLOW_MAX_YAW_RPS = 2.0
 DEFAULT_AP_IP = "192.168.12.1"
 DEFAULT_KEY_HOLD_MS = 400
 MIN_KEY_HOLD_MS = 150

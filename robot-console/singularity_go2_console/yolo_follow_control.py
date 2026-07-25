@@ -14,33 +14,43 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class YoloFollowParams:
-    """Soft walk-follow tunables (deliberately gentle)."""
+    """Person-follow tunables tuned for Go2 sport-mode walk pace.
+
+    Speed ceiling aligned with config.MAX_LINEAR_MPS / MAX_YAW_RPS so the
+    controller can actually track a brisk walk (~1.4 m/s) or a 90° crossing
+    that needs ~1.8 rad/s sustained yaw.
+    """
 
     target_distance_m: float = 1.55
     min_distance_m: float = 1.05
     distance_deadband_m: float = 0.22
-    range_rate_stop_mps: float = 0.12
+    range_rate_stop_mps: float = 0.18
     assumed_person_width_m: float = 0.45
     fx_scale: float = 0.90
-    max_vx: float = 0.38
-    max_wz: float = 0.35
-    kp_x: float = 0.32
-    k_ff: float = 0.22
-    kp_yaw: float = 0.85
-    yaw_deadband: float = 0.055
-    turn_slow_start: float = 0.16
-    backup_vx: float = 0.12
-    # Lower alpha = heavier smoothing (less twitch).
-    ema_alpha_aim: float = 0.18
-    ema_alpha_dist: float = 0.12
-    ema_alpha_rate: float = 0.15
-    ema_alpha_cmd: float = 0.16
-    # Max command change per second (butter-smooth).
-    max_dvx_mps2: float = 0.55
-    max_dwz_rps2: float = 0.70
+    # Aligned with config.FOLLOW_MAX_LINEAR_MPS / FOLLOW_MAX_YAW_RPS.
+    max_vx: float = 2.0
+    max_wz: float = 2.0
+    # Higher gains: previous values (0.32 / 0.22) were tuned for vx=0.38 cap.
+    # New linear kp reaches target pace faster without overshoot thanks to slew limits.
+    kp_x: float = 1.1
+    k_ff: float = 0.35
+    kp_yaw: float = 1.6
+    yaw_deadband: float = 0.045  # ~2.6° — tighter so we track small lateral shifts
+    turn_slow_start: float = 0.30  # rad — above this yaw error, vx forced to 0 (pivot-in-place)
+    pivot_in_place: bool = True  # when yaw error > turn_slow_start, vx forced to 0
+    backup_vx: float = 0.40
+    # Faster EMA: previous alpha=0.18 gave tau≈0.23s at 20Hz — too sluggish
+    # for a target that moves at 1.4 m/s. New tau≈0.08s keeps the bot responsive.
+    ema_alpha_aim: float = 0.45
+    ema_alpha_dist: float = 0.30
+    ema_alpha_rate: float = 0.35
+    ema_alpha_cmd: float = 0.40
+    # Slew limits raised to match new max accel (~1.0 m/s^2 is safe for Go2).
+    max_dvx_mps2: float = 2.5
+    max_dwz_rps2: float = 4.0
     # Soft taper outside deadband (meters / normalized yaw).
     soft_band_m: float = 0.35
-    soft_yaw: float = 0.12
+    soft_yaw: float = 0.10
 
 
 @dataclass(slots=True)
@@ -163,15 +173,23 @@ def compute_yolo_follow_cmd(
         abs(dist_err) <= p.distance_deadband_m
         and abs(range_rate) <= p.range_rate_stop_mps
     )
+    # Large yaw error: pivot in place (vx=0) so we can turn at max_wz and re-acquire
+    # a target that crossed 90° in front of us. This avoids the previous failure mode
+    # where the robot kept walking forward while turning, lost the target out the side.
+    pivoting = p.pivot_in_place and abs(err_yaw) > p.turn_slow_start
     if hold:
+        vx_raw = 0.0
+    elif pivoting:
         vx_raw = 0.0
     elif distance < p.min_distance_m:
         vx_raw = -min(p.backup_vx, p.max_vx)
     else:
         x_scale = _soft_scale(dist_err, p.distance_deadband_m, p.soft_band_m)
         vx_raw = (p.kp_x * dist_err + p.k_ff * range_rate) * max(x_scale, 0.15 if abs(dist_err) > p.distance_deadband_m else 0.0)
-        if abs(err_yaw) > p.turn_slow_start:
-            slow = max(0.30, 1.0 - (abs(err_yaw) - p.turn_slow_start) * 2.0)
+        # When yaw error is moderate (below pivot threshold), still slow vx proportionally
+        # so we don't drift sideways while turning. Above pivot threshold vx is already 0.
+        if abs(err_yaw) > p.yaw_deadband and abs(err_yaw) <= p.turn_slow_start:
+            slow = max(0.30, 1.0 - (abs(err_yaw) - p.yaw_deadband) / max(p.turn_slow_start - p.yaw_deadband, 1e-6))
             vx_raw *= slow
         vx_raw = max(-p.max_vx, min(p.max_vx, vx_raw))
 
