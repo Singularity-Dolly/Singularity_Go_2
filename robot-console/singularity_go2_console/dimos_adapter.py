@@ -524,6 +524,20 @@ class DimOSGo2Adapter:
             return False, "VELOCITY_OUTPUT_NOT_READY", "session not connected"
         return self._session.ensure_normal_mode()
 
+    def enable_obstacle_avoidance(self, enable: bool = True) -> bool:
+        """Enable Go2 built-in obstacle avoidance via sport ObstacleAvoidMode.
+
+        Best-effort: returns False if the API is unavailable or the session
+        is not connected. Caller (controller) treats failure as a warning
+        and falls back to software-layer SafetyController.
+        """
+        if self._session is None:
+            return False
+        fn = getattr(self._session, "enable_obstacle_avoidance", None)
+        if not callable(fn):
+            return False
+        return bool(fn(enable=enable))
+
     def get_motion_mode(self) -> tuple[str | None, str, str]:
         if self._session is None:
             return None, "VELOCITY_OUTPUT_NOT_READY", "session not connected"
@@ -695,34 +709,34 @@ class DimOSGo2Adapter:
         return inter / union if union > 0 else 0.0
 
     def _pick_locked_person(
-        self, dets: list[PersonDetection]
+        self, dets: list[PersonDetection], frame: CameraFrame | None
     ) -> PersonDetection | None:
-        if not dets:
+        """Use TargetLocker (Kalman + IoU + distance + HSV ReID) for locking.
+
+        If ``frame`` is provided, the locker uses HSV histogram ReID and can
+        re-acquire the target after brief occlusion or when IoU fails on
+        sideways motion. If the locker is in retention mode (no detection
+        confirmed but within retain window), the returned PersonDetection is
+        a synthetic one carrying the Kalman-predicted bbox.
+        """
+        if not hasattr(self, "_target_locker") or self._target_locker is None:
+            return max(dets, key=lambda d: bbox_area(d.bbox)) if dets else None
+        image = frame.image if frame is not None else None
+        det_tuples = [(d.bbox, d.confidence) for d in dets]
+        t = time.monotonic()
+        locked = self._target_locker.update(det_tuples, image, t)
+        if locked is None:
             return None
-        lock = self._follow_lock_bbox
-        if lock is None:
-            best = max(dets, key=lambda d: bbox_area(d.bbox))
-            self._follow_lock_bbox = best.bbox
-            return best
-        scored = [(self._iou(lock, d.bbox), d) for d in dets]
-        scored.sort(key=lambda t: t[0], reverse=True)
-        iou, best = scored[0]
-        if iou >= 0.15:
-            # Soft lock update (EMA-like blend) to avoid box jumps.
-            lx1, ly1, lx2, ly2 = lock
-            bx1, by1, bx2, by2 = best.bbox
-            a = 0.35
-            self._follow_lock_bbox = (
-                (1 - a) * lx1 + a * bx1,
-                (1 - a) * ly1 + a * by1,
-                (1 - a) * lx2 + a * bx2,
-                (1 - a) * ly2 + a * by2,
-            )
-            return best
-        # Lost lock — retarget largest centered-ish person.
-        best = max(dets, key=lambda d: bbox_area(d.bbox))
-        self._follow_lock_bbox = best.bbox
-        return best
+        # Find the underlying PersonDetection if a real detection matched.
+        for d in dets:
+            if d.bbox == locked.bbox:
+                return d
+        # Otherwise build a synthetic PersonDetection from the predicted bbox.
+        return PersonDetection(
+            bbox=locked.bbox,
+            confidence=locked.confidence,
+            class_name="person",
+        )
 
     def _yolo_follow_loop(self, image_width: int, image_height: int) -> None:
         """Smooth person follow: face aim + body range + slew limits."""
@@ -731,6 +745,9 @@ class DimOSGo2Adapter:
         self._yolo_follow_state = YoloFollowState()
         face = self._face_tracker or FaceTracker()
         self._face_tracker = face
+        # Initialize the TargetLocker with image size — replaces _follow_lock_bbox.
+        from singularity_go2_console.target_locker import TargetLocker
+        self._target_locker = TargetLocker(image_size=(image_width, image_height))
         while not self._follow_stop.is_set():
             t0 = time.monotonic()
             frame = self.get_latest_frame()
@@ -740,7 +757,7 @@ class DimOSGo2Adapter:
             else:
                 try:
                     dets = self.detect_persons(frame)
-                    person = self._pick_locked_person(dets)
+                    person = self._pick_locked_person(dets, frame)
                     if person is None:
                         self._last_follow_cmd = (0.0, 0.0, 0.0)
                         self._target_visible = False
@@ -773,6 +790,8 @@ class DimOSGo2Adapter:
         self._following = False
         self._target_visible = False
         self._follow_lock_bbox = None
+        if hasattr(self, "_target_locker"):
+            self._target_locker.reset()
 
     def _as_dimos_image(self, frame: CameraFrame) -> Any:
         try:
