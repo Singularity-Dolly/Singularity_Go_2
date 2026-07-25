@@ -218,14 +218,29 @@ class TestSafetyController:
             assert reason == RejectionReason.OBSTACLE_BLOCKING.value
 
     def test_obstacle_allows_stop_and_query_commands(self) -> None:
-        """STOP / status / query commands always pass even with obstacle active."""
+        """STOP / status / query commands always pass even with obstacle active.
+
+        Note: None (unknown command type) is NOT in the allowed set — when
+        obstacle is active, unknown commands are conservatively blocked.
+        Callers must pass an explicit command_type to bypass the obstacle gate.
+        """
         sc = SafetyController()
         sc.update_obstacle(True)
 
-        for cmd_type in ("stop", "stop_all", "status", "query", None):
+        for cmd_type in ("stop", "stop_all", "status", "query"):
             can_accept, reason = sc.can_accept_command(cmd_type)
             assert can_accept is True, f"{cmd_type} should pass"
             assert reason == "ok"
+
+    def test_obstacle_blocks_unknown_command_type(self) -> None:
+        """Unknown / None command type is blocked when obstacle is active —
+        conservative default since we can't prove it's a non-motion command."""
+        sc = SafetyController()
+        sc.update_obstacle(True)
+
+        can_accept, reason = sc.can_accept_command(None)
+        assert can_accept is False
+        assert reason == RejectionReason.OBSTACLE_BLOCKING.value
 
     def test_obstacle_distance_hard_stop_overrides_boolean(self) -> None:
         """Distance < OBSTACLE_HARD_STOP_M forces obstacle=True even if

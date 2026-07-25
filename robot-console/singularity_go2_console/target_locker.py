@@ -43,21 +43,29 @@ Detection = tuple[Bbox, float]  # (bbox_xyxy, confidence)
 class _Kalman2D:
     """Constant-velocity Kalman filter on (cx, cy, vx, vy).
 
-    Process model: position += velocity * dt. Sufficient for human walking
-    at ~1.5 m/s; tuned for camera framerate ~20 Hz.
+    Uses the standard white-noise-acceleration process model (Bar-Shalom §6.6):
+    the process noise Q is derived from a single scalar ``sigma_a`` (std dev of
+    acceleration noise in px/s^2), which properly couples position and velocity
+    via the off-diagonal terms. This lets velocity be inferred from
+    position-only measurements within 2-3 frames — the previous diagonal Q
+    formulation starved the cross-covariance and left velocity at <3% of truth
+    after 3 updates.
+
+    Tuned for human following at ~1.5 m/s on a 640x480 frame at ~20 Hz:
+    - sigma_a = 600 px/s^2 (~2 m/s^2): realistic human acceleration
+    - r_meas = 4.0 px^2: YOLO bbox center jitter (~2 px std)
     """
 
     x: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=np.float64))
     P: np.ndarray = field(default_factory=lambda: np.eye(4, dtype=np.float64) * 100.0)
-    q_pos: float = 0.05
-    q_vel: float = 0.50
+    sigma_a: float = 600.0
     r_meas: float = 4.0
     last_t: float | None = None
     initialized: bool = False
 
     def init(self, cx: float, cy: float, t: float) -> None:
         self.x[:] = (cx, cy, 0.0, 0.0)
-        self.P = np.eye(4, dtype=np.float64) * 10.0
+        self.P = np.eye(4, dtype=np.float64) * 100.0
         self.last_t = t
         self.initialized = True
 
@@ -66,6 +74,7 @@ class _Kalman2D:
             return None
         dt = max(t - self.last_t, 1e-3)
         if dt > 1.0:
+            # Long gap — damp velocity (target may have changed direction)
             self.x[2] *= 0.5
             self.x[3] *= 0.5
             dt = min(dt, 1.0)
@@ -78,12 +87,19 @@ class _Kalman2D:
             ],
             dtype=np.float64,
         )
-        Q = np.array(
+        # Standard constant-velocity process noise with white acceleration.
+        # sa^2 * [[dt^4/4, 0, dt^3/2, 0], [0, dt^4/4, 0, dt^3/2],
+        #          [dt^3/2, 0, dt^2,   0], [0, dt^3/2, 0, dt^2  ]]
+        sa2 = self.sigma_a * self.sigma_a
+        dt2 = dt * dt
+        dt3 = dt2 * dt
+        dt4 = dt2 * dt2
+        Q = sa2 * np.array(
             [
-                [self.q_pos * dt, 0.0, 0.0, 0.0],
-                [0.0, self.q_pos * dt, 0.0, 0.0],
-                [0.0, 0.0, self.q_vel * dt, 0.0],
-                [0.0, 0.0, 0.0, self.q_vel * dt],
+                [dt4 / 4.0, 0.0, dt3 / 2.0, 0.0],
+                [0.0, dt4 / 4.0, 0.0, dt3 / 2.0],
+                [dt3 / 2.0, 0.0, dt2, 0.0],
+                [0.0, dt3 / 2.0, 0.0, dt2],
             ],
             dtype=np.float64,
         )
@@ -156,7 +172,7 @@ def _compute_color_hist(image: np.ndarray, bbox: Bbox) -> np.ndarray:
         return np.zeros((1,), dtype=np.float32)
     roi = image[y1i:y2i, x1i:x2i]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+    hist: np.ndarray = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
     # Manual L1 normalization — cv2.normalize in-place on L1 had edge cases
     # where it zeroed the array when src==dst.
     total = float(hist.sum())
