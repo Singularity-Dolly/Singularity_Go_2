@@ -45,6 +45,7 @@ def _load_config(
     tracker_only: bool = False,
     connection_mode: Optional[str] = None,
     aes_key_file: Optional[str] = None,
+    allow_normal_mode_switch: Optional[bool] = None,
 ) -> Go2CtlConfig:
     cfg = Go2CtlConfig.from_environ(load_aes=True, require_aes=False)
     overrides = {
@@ -60,6 +61,8 @@ def _load_config(
         overrides["aes_key_file"] = aes_key_file
         from singularity_go2_console.aes import load_aes_key
         overrides["aes_key"] = load_aes_key(key_file=aes_key_file)
+    if allow_normal_mode_switch is not None:
+        overrides["allow_normal_mode_switch"] = allow_normal_mode_switch
     return cfg.with_overrides(**overrides)
 
 
@@ -76,6 +79,7 @@ def _build_controller(cfg: Go2CtlConfig) -> Go2Controller:
         detection_confidence=cfg.detection_confidence,
         connection_mode=cfg.connection_mode,
         aes_key=cfg.aes_key.value if cfg.aes_key else None,
+        allow_normal_mode_switch=cfg.allow_normal_mode_switch,
     )
     if adapter.mock:
         raise RuntimeError("Refusing mock adapter in real mode")
@@ -343,6 +347,11 @@ def start(
     detect_only: bool = typer.Option(False, "--detect-only"),
     tracker_only: bool = typer.Option(False, "--tracker-only"),
     no_console: bool = typer.Option(False, "--no-console"),
+    allow_normal_mode_switch: bool = typer.Option(
+        False,
+        "--allow-normal-mode-switch",
+        help="Allow explicit switch to motion mode normal (disabled by default)",
+    ),
 ) -> None:
     """Connect and enter the requested mode (default: automatic front-person follow)."""
     cfg = _load_config(
@@ -353,6 +362,7 @@ def start(
         tracker_only=tracker_only,
         connection_mode=connection_mode,
         aes_key_file=aes_key_file,
+        allow_normal_mode_switch=allow_normal_mode_switch,
     )
     raise typer.Exit(asyncio.run(_start_session(cfg, open_console=not no_console)))
 
@@ -364,6 +374,11 @@ def console_cmd(
     aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file"),
     mode: str = typer.Option("manual", "--mode"),
     mock: bool = typer.Option(False, "--mock"),
+    allow_normal_mode_switch: bool = typer.Option(
+        False,
+        "--allow-normal-mode-switch",
+        help="Allow explicit switch to motion mode normal (disabled by default)",
+    ),
 ) -> None:
     """Interactive terminal console."""
     cfg = _load_config(
@@ -372,6 +387,7 @@ def console_cmd(
         mock=mock,
         connection_mode=connection_mode,
         aes_key_file=aes_key_file,
+        allow_normal_mode_switch=allow_normal_mode_switch,
     )
     raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
 
@@ -382,6 +398,11 @@ def manual(
     connection_mode: str = typer.Option("ap", "--connection-mode", help="ap|sta"),
     aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file"),
     mock: bool = typer.Option(False, "--mock"),
+    allow_normal_mode_switch: bool = typer.Option(
+        False,
+        "--allow-normal-mode-switch",
+        help="Allow explicit switch to motion mode normal (disabled by default)",
+    ),
 ) -> None:
     """Start in manual teleop mode."""
     cfg = _load_config(
@@ -390,6 +411,7 @@ def manual(
         mock=mock,
         connection_mode=connection_mode,
         aes_key_file=aes_key_file,
+        allow_normal_mode_switch=allow_normal_mode_switch,
     )
     raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
 
@@ -400,6 +422,11 @@ def follow(
     connection_mode: str = typer.Option("ap", "--connection-mode", help="ap|sta"),
     aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file"),
     mock: bool = typer.Option(False, "--mock"),
+    allow_normal_mode_switch: bool = typer.Option(
+        False,
+        "--allow-normal-mode-switch",
+        help="Allow explicit switch to motion mode normal (disabled by default)",
+    ),
 ) -> None:
     """Start automatic front-person follow."""
     cfg = _load_config(
@@ -408,6 +435,7 @@ def follow(
         mock=mock,
         connection_mode=connection_mode,
         aes_key_file=aes_key_file,
+        allow_normal_mode_switch=allow_normal_mode_switch,
     )
     raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
 

@@ -9,11 +9,15 @@ Exact verified constructors (no AP↔STA fallback, no silent DimOS LocalSTA swap
     UnitreeWebRTCConnection(
         WebRTCConnectionMethod.LocalSTA, ip=robot_ip, aes_128_key=key
     )
+
+Locomotion transport uses sport-mode request API (SPORT_MOD Move / StopMove).
+WIRELESS_CONTROLLER is diagnostics-only and is not the default movement path.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -25,6 +29,76 @@ logger = logging.getLogger("go2ctl.webrtc")
 
 ConnectionMode = Literal["ap", "sta"]
 LOCAL_AP_IP = "192.168.12.1"
+
+# Motion switcher API IDs (Unitree motion_switcher service; not SPORT_CMD).
+MOTION_SWITCHER_CHECK_MODE = 1001
+MOTION_SWITCHER_SELECT_MODE = 1002
+REQUIRED_MOTION_MODE = "normal"
+
+
+def _sport_constants() -> tuple[dict[str, Any], dict[str, int]]:
+    from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD
+
+    return RTC_TOPIC, SPORT_CMD
+
+
+def parse_motion_mode_name(response: Any) -> str | None:
+    """Extract motion-switcher mode name from a publish_request_new response."""
+    if response is None:
+        return None
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except json.JSONDecodeError:
+            return response.strip() or None
+
+    if not isinstance(response, dict):
+        return None
+
+    candidates: list[Any] = [
+        response.get("name"),
+        response.get("mode"),
+    ]
+    data = response.get("data")
+    if isinstance(data, dict):
+        candidates.extend(
+            [
+                data.get("name"),
+                data.get("mode"),
+                data.get("data"),
+                data.get("parameter"),
+            ]
+        )
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            candidates.extend([nested.get("name"), nested.get("mode")])
+    elif isinstance(data, str):
+        candidates.append(data)
+
+    for item in candidates:
+        if item is None:
+            continue
+        if isinstance(item, dict):
+            name = item.get("name") or item.get("mode")
+            if isinstance(name, str) and name.strip():
+                return name.strip().lower()
+            continue
+        if isinstance(item, str):
+            text = item.strip()
+            if not text:
+                continue
+            if text.startswith("{") or text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    return text.lower()
+                if isinstance(parsed, dict):
+                    name = parsed.get("name") or parsed.get("mode")
+                    if isinstance(name, str) and name.strip():
+                        return name.strip().lower()
+            else:
+                return text.lower()
+    return None
 
 
 def build_unitree_connection(
@@ -81,15 +155,30 @@ def build_unitree_connection(
 class Go2WebRTCSession:
     """Background event-loop session around unitree_webrtc_connect."""
 
-    def __init__(self, conn: Any) -> None:
+    def __init__(
+        self,
+        conn: Any,
+        *,
+        allow_normal_mode_switch: bool = False,
+        motion_mode_cache_s: float = 1.0,
+        mode_switch_timeout_s: float = 5.0,
+    ) -> None:
         self.conn = conn
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
-        self._cmd_vel_timeout = 0.2
-        self.stop_timer: threading.Timer | None = None
+        self.allow_normal_mode_switch = bool(allow_normal_mode_switch)
+        self.motion_mode_cache_s = float(motion_mode_cache_s)
+        self.mode_switch_timeout_s = float(mode_switch_timeout_s)
         self.datachannel_ok = False
         self.velocity_channel_ok = False
+        self.last_error_code: str | None = None
+        self.last_error_message: str = ""
+        self.sport_requests: list[dict[str, Any]] = []
+        self.wireless_diagnostics: list[dict[str, float]] = []
+        self._cached_motion_mode: str | None = None
+        self._cached_motion_mode_at: float | None = None
+        self._move_active = False
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self.loop)
@@ -116,10 +205,10 @@ class Go2WebRTCSession:
             self.datachannel_ok = True
             pub_sub = getattr(dc, "pub_sub", None)
             self.velocity_channel_ok = pub_sub is not None and hasattr(
-                pub_sub, "publish_without_callback"
+                pub_sub, "publish_request_new"
             )
             if not self.velocity_channel_ok:
-                raise RuntimeError("velocity channel unavailable")
+                raise RuntimeError("sport-mode request channel unavailable")
 
         try:
             self._run(_async_connect(), timeout=60.0)
@@ -127,9 +216,18 @@ class Go2WebRTCSession:
             self.close()
             raise
 
+    def _record_sport(self, name: str, **payload: Any) -> None:
+        RTC_TOPIC, SPORT_CMD = _sport_constants()
+        entry = {
+            "topic": RTC_TOPIC["SPORT_MOD"],
+            "api": name,
+            "api_id": SPORT_CMD[name],
+            **payload,
+        }
+        self.sport_requests.append(entry)
+
     def publish_wireless(self, lx: float, ly: float, rx: float, ry: float = 0.0) -> bool:
-        if not self.velocity_channel_ok:
-            return False
+        """Diagnostics-only helper. Not used for default locomotion."""
         try:
             from unitree_webrtc_connect.constants import RTC_TOPIC
 
@@ -140,27 +238,150 @@ class Go2WebRTCSession:
                 )
 
             self.loop.call_soon_threadsafe(_pub)
+            self.wireless_diagnostics.append(
+                {"lx": float(lx), "ly": float(ly), "rx": float(rx), "ry": float(ry)}
+            )
             return True
         except Exception:
-            logger.exception("wireless publish failed")
+            logger.exception("wireless diagnostic publish failed")
             return False
 
-    def move(self, vx: float, vy: float, wz: float) -> bool:
-        ok = self.publish_wireless(lx=-vy, ly=vx, rx=-wz, ry=0.0)
-        if not ok:
-            return False
-        if self.stop_timer:
-            self.stop_timer.cancel()
-        self.stop_timer = threading.Timer(self._cmd_vel_timeout, self.stop_movement)
-        self.stop_timer.daemon = True
-        self.stop_timer.start()
+    async def _async_get_motion_mode(self, *, use_cache: bool = True) -> str | None:
+        now = time.monotonic()
+        if (
+            use_cache
+            and self._cached_motion_mode is not None
+            and self._cached_motion_mode_at is not None
+            and (now - self._cached_motion_mode_at) < self.motion_mode_cache_s
+        ):
+            return self._cached_motion_mode
+
+        from unitree_webrtc_connect.constants import RTC_TOPIC
+
+        response = await self.conn.datachannel.pub_sub.publish_request_new(
+            RTC_TOPIC["MOTION_SWITCHER"],
+            {"api_id": MOTION_SWITCHER_CHECK_MODE},
+        )
+        name = parse_motion_mode_name(response)
+        self._cached_motion_mode = name
+        self._cached_motion_mode_at = time.monotonic()
+        return name
+
+    def get_motion_mode(self, *, use_cache: bool = True) -> tuple[str | None, str, str]:
+        """Read-only motion mode query (MOTION_SWITCHER api_id 1001)."""
+        try:
+            name = self._run(
+                self._async_get_motion_mode(use_cache=use_cache), timeout=5.0
+            )
+            return name, "OK", f"motion mode={name}"
+        except Exception as exc:  # noqa: BLE001
+            self.last_error_code = "INTERNAL_ERROR"
+            self.last_error_message = str(exc)
+            return None, "INTERNAL_ERROR", str(exc)
+
+    async def _async_switch_to_normal(self) -> tuple[bool, str, str]:
+        if not self.allow_normal_mode_switch:
+            return (
+                False,
+                "MOTION_MODE_SWITCH_DISABLED",
+                "Pass --allow-normal-mode-switch to enable operator mode switch",
+            )
+        from unitree_webrtc_connect.constants import RTC_TOPIC
+
+        await self.conn.datachannel.pub_sub.publish_request_new(
+            RTC_TOPIC["MOTION_SWITCHER"],
+            {
+                "api_id": MOTION_SWITCHER_SELECT_MODE,
+                "parameter": {"name": REQUIRED_MOTION_MODE},
+            },
+        )
+        deadline = time.monotonic() + self.mode_switch_timeout_s
+        while time.monotonic() < deadline:
+            name = await self._async_get_motion_mode(use_cache=False)
+            if name == REQUIRED_MOTION_MODE:
+                return True, "OK", "motion mode is normal"
+            await asyncio.sleep(0.1)
+        return (
+            False,
+            "MOTION_MODE_NOT_NORMAL",
+            "timed out waiting for motion mode normal confirmation",
+        )
+
+    def ensure_normal_mode(self) -> tuple[bool, str, str]:
+        """Operator-gated switch to normal mode (disabled by default)."""
+        try:
+            ok, code, message = self._run(self._async_switch_to_normal(), timeout=15.0)
+            self.last_error_code = None if ok else code
+            self.last_error_message = "" if ok else message
+            return ok, code, message
+        except Exception as exc:  # noqa: BLE001
+            self.last_error_code = "INTERNAL_ERROR"
+            self.last_error_message = str(exc)
+            return False, "INTERNAL_ERROR", str(exc)
+
+    async def _async_stop_move(self) -> bool:
+        RTC_TOPIC, SPORT_CMD = _sport_constants()
+        await self.conn.datachannel.pub_sub.publish_request_new(
+            RTC_TOPIC["SPORT_MOD"],
+            {"api_id": SPORT_CMD["StopMove"]},
+        )
+        self._record_sport("StopMove")
+        self._move_active = False
         return True
 
+    async def _async_move(self, vx: float, vy: float, wz: float) -> tuple[bool, str, str]:
+        mode = await self._async_get_motion_mode(use_cache=True)
+        if mode != REQUIRED_MOTION_MODE:
+            try:
+                await self._async_stop_move()
+            except Exception:  # noqa: BLE001
+                logger.exception("StopMove after non-normal mode failed")
+            return (
+                False,
+                "MOTION_MODE_NOT_NORMAL",
+                f"motion mode is {mode!r}; require '{REQUIRED_MOTION_MODE}' "
+                "(no automatic mode switch)",
+            )
+
+        RTC_TOPIC, SPORT_CMD = _sport_constants()
+        await self.conn.datachannel.pub_sub.publish_request_new(
+            RTC_TOPIC["SPORT_MOD"],
+            {
+                "api_id": SPORT_CMD["Move"],
+                "parameter": {"x": float(vx), "y": float(vy), "z": float(wz)},
+            },
+        )
+        self._record_sport("Move", x=float(vx), y=float(vy), z=float(wz))
+        self._move_active = True
+        return True, "OK", "sport Move published"
+
+    def move(self, vx: float, vy: float, wz: float) -> bool:
+        """Publish sport-mode Move (x=vx, y=vy, z=wz). Not wireless joystick."""
+        try:
+            ok, code, message = self._run(
+                self._async_move(float(vx), float(vy), float(wz)), timeout=5.0
+            )
+            self.last_error_code = None if ok else code
+            self.last_error_message = "" if ok else message
+            return bool(ok)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("sport Move failed")
+            self.last_error_code = "VELOCITY_CHANNEL_UNAVAILABLE"
+            self.last_error_message = str(exc)
+            return False
+
     def stop_movement(self) -> bool:
-        if self.stop_timer:
-            self.stop_timer.cancel()
-            self.stop_timer = None
-        return self.publish_wireless(0.0, 0.0, 0.0, 0.0)
+        """Publish sport-mode StopMove once for this stop call."""
+        try:
+            ok = self._run(self._async_stop_move(), timeout=5.0)
+            self.last_error_code = None if ok else "VELOCITY_CHANNEL_UNAVAILABLE"
+            self.last_error_message = "" if ok else "StopMove failed"
+            return bool(ok)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("sport StopMove failed")
+            self.last_error_code = "VELOCITY_CHANNEL_UNAVAILABLE"
+            self.last_error_message = str(exc)
+            return False
 
     def enable_video(self, on_frame: Callable[[Any], None]) -> bool:
         try:
@@ -183,9 +404,6 @@ class Go2WebRTCSession:
             return False
 
     def close(self) -> None:
-        if self.stop_timer:
-            self.stop_timer.cancel()
-            self.stop_timer = None
         try:
             self.stop_movement()
         except Exception:  # noqa: BLE001
@@ -210,11 +428,16 @@ class Go2WebRTCSession:
 
 
 async def start_connection(
-    connection: Any, *, connection_mode: ConnectionMode
+    connection: Any,
+    *,
+    connection_mode: ConnectionMode,
+    allow_normal_mode_switch: bool = False,
 ) -> tuple[bool, str, Go2WebRTCSession | None, str]:
-    """Start connection inside a Go2WebRTCSession and verify data/velocity channels."""
+    """Start connection inside a Go2WebRTCSession and verify data/sport channels."""
     secrets: list[str] = []
-    session = Go2WebRTCSession(connection)
+    session = Go2WebRTCSession(
+        connection, allow_normal_mode_switch=allow_normal_mode_switch
+    )
     try:
         session.connect_and_verify()
         if not session.datachannel_ok:
@@ -226,7 +449,7 @@ async def start_connection(
                 False,
                 "VELOCITY_CHANNEL_UNAVAILABLE",
                 None,
-                "velocity channel unavailable",
+                "sport-mode request channel unavailable",
             )
         return True, "OK", session, f"{connection_mode} connected"
     except Exception as exc:  # noqa: BLE001
@@ -238,7 +461,7 @@ async def start_connection(
             return False, code, None, msg
         if "datachannel" in lower:
             return False, "WEBRTC_DATA_CHANNEL_FAILED", None, msg
-        if "velocity" in lower:
+        if "sport-mode" in lower or "velocity" in lower:
             return False, "VELOCITY_CHANNEL_UNAVAILABLE", None, msg
         code = (
             "LOCAL_AP_SIGNALING_FAILED"

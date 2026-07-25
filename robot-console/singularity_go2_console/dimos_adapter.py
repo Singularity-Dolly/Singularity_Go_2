@@ -58,6 +58,7 @@ class DimOSGo2Adapter:
         control_hz: float = 20.0,
         connection_mode: str = "ap",
         aes_key: str | None = None,
+        allow_normal_mode_switch: bool = False,
     ) -> None:
         self._detector_model = detector_model
         self._detection_confidence = detection_confidence
@@ -69,6 +70,7 @@ class DimOSGo2Adapter:
             raise ValueError("connection_mode must be ap or sta")
         self._connection_mode = mode
         self._aes_key = aes_key
+        self._allow_normal_mode_switch = bool(allow_normal_mode_switch)
 
         self._connected = False
         self._robot_ip: str | None = None
@@ -89,6 +91,8 @@ class DimOSGo2Adapter:
         self._cmd_bridge: Any | None = None  # optional intercept for injected skill
         self._warned_compat = False
         self._published_commands: list[tuple[float, float, float]] = []
+        self.last_velocity_error_code: str | None = None
+        self.last_velocity_error_message: str = ""
 
     @property
     def mock(self) -> bool:
@@ -141,7 +145,9 @@ class DimOSGo2Adapter:
             return False, code, redact_secrets(message, secrets)
 
         ok, code, session, message = await start_connection(
-            connection, connection_mode=self._connection_mode  # type: ignore[arg-type]
+            connection,
+            connection_mode=self._connection_mode,  # type: ignore[arg-type]
+            allow_normal_mode_switch=self._allow_normal_mode_switch,
         )
         if not ok or session is None:
             return False, code, redact_secrets(message, secrets)
@@ -317,13 +323,23 @@ class DimOSGo2Adapter:
 
             zero_ok = self.publish_zero()
             stop_ok = bool(self._session and self._session.stop_movement())
+            sport_requests = list(getattr(self._session, "sport_requests", []) or [])
             out["zero_velocity"] = zero_ok
             out["stop_path"] = stop_ok
             out["commands"] = list(self._published_commands)
+            out["sport_requests"] = sport_requests
+            out["move_sent"] = any(
+                str(item.get("api")) == "Move" for item in sport_requests
+            )
             out["nonzero_velocity_sent"] = any(
                 abs(vx) > 1e-12 or abs(vy) > 1e-12 or abs(wz) > 1e-12
                 for vx, vy, wz in self._published_commands
             )
+            if out["move_sent"]:
+                out["ok"] = False
+                out["error_code"] = "INTERNAL_ERROR"
+                out["message"] = "preflight sent sport Move — abort"
+                return out
             if out["nonzero_velocity_sent"]:
                 out["ok"] = False
                 out["error_code"] = "INTERNAL_ERROR"
@@ -428,16 +444,58 @@ class DimOSGo2Adapter:
 
     def publish_velocity(self, vx: float, vy: float, wz: float) -> bool:
         if self._session is None:
+            self.last_velocity_error_code = "VELOCITY_OUTPUT_NOT_READY"
+            self.last_velocity_error_message = "session not connected"
             return False
-        self._published_commands.append((float(vx), float(vy), float(wz)))
-        return bool(self._session.move(vx, vy, wz))
+        ok = bool(self._session.move(vx, vy, wz))
+        if ok:
+            self._published_commands.append((float(vx), float(vy), float(wz)))
+            self.last_velocity_error_code = None
+            self.last_velocity_error_message = ""
+            return True
+        self.last_velocity_error_code = getattr(
+            self._session, "last_error_code", "VELOCITY_OUTPUT_NOT_READY"
+        )
+        self.last_velocity_error_message = getattr(
+            self._session, "last_error_message", "Move failed"
+        )
+        return False
 
     def publish_zero(self) -> bool:
         if self._session is None:
+            self.last_velocity_error_code = "VELOCITY_OUTPUT_NOT_READY"
+            self.last_velocity_error_message = "session not connected"
             return False
+        ok = bool(self._session.stop_movement())
         self._published_commands.append((0.0, 0.0, 0.0))
-        return bool(self._session.stop_movement())
+        if ok:
+            self.last_velocity_error_code = None
+            self.last_velocity_error_message = ""
+        else:
+            self.last_velocity_error_code = getattr(
+                self._session, "last_error_code", "VELOCITY_OUTPUT_NOT_READY"
+            )
+            self.last_velocity_error_message = getattr(
+                self._session, "last_error_message", "StopMove failed"
+            )
+        return ok
 
+    def ensure_normal_mode(self) -> tuple[bool, str, str]:
+        """Operator-gated switch to motion mode normal (disabled unless configured)."""
+        if not self._allow_normal_mode_switch:
+            return (
+                False,
+                "MOTION_MODE_SWITCH_DISABLED",
+                "Pass --allow-normal-mode-switch to enable operator mode switch",
+            )
+        if self._session is None:
+            return False, "VELOCITY_OUTPUT_NOT_READY", "session not connected"
+        return self._session.ensure_normal_mode()
+
+    def get_motion_mode(self) -> tuple[str | None, str, str]:
+        if self._session is None:
+            return None, "VELOCITY_OUTPUT_NOT_READY", "session not connected"
+        return self._session.get_motion_mode(use_cache=False)
 
     def encode_frame_jpeg_bytes(self, frame: CameraFrame) -> bytes | None:
         try:

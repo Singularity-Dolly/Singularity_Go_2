@@ -97,9 +97,25 @@ class VelocityMux:
 
             ok = self._sink.publish_velocity(vx, vy, wz)
             if not ok:
+                code_name = getattr(self._sink, "last_velocity_error_code", None)
+                message = getattr(
+                    self._sink,
+                    "last_velocity_error_message",
+                    "Velocity sink failed to publish",
+                )
+                if code_name == ErrorCode.MOTION_MODE_NOT_NORMAL.value:
+                    return ControllerResult.failure(
+                        ErrorCode.MOTION_MODE_NOT_NORMAL,
+                        str(message) or "Motion mode is not normal",
+                    )
+                if code_name == ErrorCode.MOTION_MODE_SWITCH_DISABLED.value:
+                    return ControllerResult.failure(
+                        ErrorCode.MOTION_MODE_SWITCH_DISABLED,
+                        str(message) or "Normal mode switch disabled",
+                    )
                 return ControllerResult.failure(
                     ErrorCode.VELOCITY_OUTPUT_NOT_READY,
-                    "Velocity sink failed to publish",
+                    str(message) or "Velocity sink failed to publish",
                 )
             self._last = VelocityCommand(vx, vy, wz, owner)
             return ControllerResult.success(

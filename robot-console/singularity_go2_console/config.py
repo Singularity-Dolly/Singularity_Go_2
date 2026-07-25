@@ -107,6 +107,7 @@ class Go2CtlConfig:
     follow_query: str = "front person"
     robot_id: str = "go2_62507"
     motion_enabled: bool = False
+    allow_normal_mode_switch: bool = False
 
     @classmethod
     def from_environ(
@@ -176,6 +177,9 @@ class Go2CtlConfig:
             or os.environ.get("GO2CTL_ROBOT_ID")
             or "go2_62507",
             motion_enabled=_env_bool("GO2CTL_MOTION_ENABLED", False),
+            allow_normal_mode_switch=_env_bool(
+                "GO2CTL_ALLOW_NORMAL_MODE_SWITCH", False
+            ),
         )
 
     def with_overrides(self, **kwargs: Any) -> Go2CtlConfig:
