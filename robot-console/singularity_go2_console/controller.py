@@ -247,7 +247,13 @@ class Go2Controller:
         return ControllerResult.success(message=message)
 
     def _maybe_arm_locomotion(self) -> None:
-        """Operator-gated normal mode + BalanceStand (via adapter.ensure_normal_mode)."""
+        """Operator-gated normal mode + BalanceStand (via adapter.ensure_normal_mode).
+
+        After successful arm-up, also enables Go2's built-in obstacle
+        avoidance so the robot's LiDAR + depth cam actively decelerate / stop
+        before contact. The software-layer SafetyController provides a
+        redundant <0.3 m hard stop as backup.
+        """
         if not getattr(self.config, "allow_normal_mode_switch", False):
             return
         ensure = getattr(self.adapter, "ensure_normal_mode", None)
@@ -269,6 +275,26 @@ class Go2Controller:
         else:
             self._last_error = None
             self._last_error_code = None
+            # Enable Go2 built-in obstacle avoidance. Best-effort: failures
+            # are logged but never fatal — software-layer safety stop still
+            # protects against contact.
+            enable_obstacle = getattr(self.adapter, "enable_obstacle_avoidance", None)
+            if callable(enable_obstacle):
+                try:
+                    obstacle_ok = enable_obstacle(enable=True)
+                    if obstacle_ok:
+                        logger.info("Go2 obstacle avoidance enabled (sport mode)")
+                    else:
+                        logger.warning(
+                            "Go2 obstacle avoidance enable returned False — "
+                            "software-layer hard stop is the only safety net"
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "enable_obstacle_avoidance raised — continuing with "
+                        "software-layer safety only",
+                        exc_info=True,
+                    )
 
     async def start_manual(self) -> ControllerResult:
         self._last_command = "manual.start"

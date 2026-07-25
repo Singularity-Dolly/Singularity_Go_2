@@ -430,6 +430,38 @@ class Go2WebRTCSession:
     async def _async_stop_move(self) -> bool:
         return await self._async_publish_sport("StopMove")
 
+    async def _async_enable_obstacle_avoidance(self, enable: bool = True) -> bool:
+        """Toggle Go2's built-in obstacle avoidance (LiDAR + front depth cam).
+
+        Go2 sport mode API exposes ``ObstacleAvoidMode`` with parameter
+        ``{"mode": 1}`` to enable, ``{"mode": 0}`` to disable. We send the
+        command but treat failure as soft — the robot can still be driven
+        manually. Caller should log the result, not crash.
+
+        Ref: unitree_webrtc_connect.constants.SPORT_CMD["ObstacleAvoidMode"]
+        """
+        try:
+            return await self._async_publish_sport(
+                "ObstacleAvoidMode",
+                {"mode": 1 if enable else 0},
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "ObstacleAvoidMode %s failed — Go2 may reject this API name on "
+                "older firmware. Robot will rely on software-layer safety stop.",
+                "enable" if enable else "disable",
+                exc_info=True,
+            )
+            return False
+
+    def enable_obstacle_avoidance(self, enable: bool = True) -> bool:
+        """Synchronous wrapper. Best-effort — logs failure, never raises."""
+        try:
+            return self._run(self._async_enable_obstacle_avoidance(enable), timeout=2.0)
+        except Exception:  # noqa: BLE001
+            logger.warning("enable_obstacle_avoidance wrapper failed", exc_info=True)
+            return False
+
     async def _async_move(self, vx: float, vy: float, wz: float) -> tuple[bool, str, str]:
         try:
             mode = await self._async_get_motion_mode(use_cache=True)
