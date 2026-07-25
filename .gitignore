@@ -5,6 +5,7 @@ dimos/
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
 dist/
 .venv/
 
@@ -21,3 +22,10 @@ Thumbs.db
 # Environment
 .env
 .env.local
+aes_key
+*.aes
+robot-service.env
+.config/go2ctl/
+.go2ctl-logs/
+.dimos-logs/
+.secrets/
