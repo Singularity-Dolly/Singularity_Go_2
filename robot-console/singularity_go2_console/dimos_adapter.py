@@ -16,6 +16,7 @@ Compatibility note (DimOS main / 2026):
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import threading
@@ -71,6 +72,7 @@ class DimOSGo2Adapter:
 
         self._connected = False
         self._robot_ip: str | None = None
+        self._session: Any | None = None
         self._connection: Any | None = None
         self._video_sub: Any | None = None
         self._latest_frame: CameraFrame | None = None
@@ -86,6 +88,7 @@ class DimOSGo2Adapter:
         self._target_visible = False
         self._cmd_bridge: Any | None = None  # optional intercept for injected skill
         self._warned_compat = False
+        self._published_commands: list[tuple[float, float, float]] = []
 
     @property
     def mock(self) -> bool:
@@ -93,7 +96,7 @@ class DimOSGo2Adapter:
 
     @property
     def connected(self) -> bool:
-        return self._connected and self._connection is not None
+        return self._connected and self._session is not None
 
     @property
     def camera_ready(self) -> bool:
@@ -101,7 +104,9 @@ class DimOSGo2Adapter:
 
     @property
     def velocity_ready(self) -> bool:
-        return self.connected
+        return self.connected and bool(
+            self._session and getattr(self._session, "velocity_channel_ok", False)
+        )
 
     @property
     def detector_ready(self) -> bool:
@@ -112,12 +117,16 @@ class DimOSGo2Adapter:
         ok, _ = dimos_available()
         return self.connected and ok
 
-    async def connect(self, robot_ip: str) -> tuple[bool, str, str]:
+    async def connect(self, robot_ip: str | None = None) -> tuple[bool, str, str]:
         if not self._aes_key:
             return False, "AES_KEY_REQUIRED", "AES-128 key required for Go2 firmware auth"
 
+        if self._connection_mode == "sta" and not (robot_ip and str(robot_ip).strip()):
+            return False, "STA_ROBOT_IP_REQUIRED", "STA mode requires --robot-ip"
+
         from singularity_go2_console.aes import redact_secrets
         from singularity_go2_console.webrtc_connect import (
+            LOCAL_AP_IP,
             build_unitree_connection,
             start_connection,
         )
@@ -131,45 +140,57 @@ class DimOSGo2Adapter:
         if connection is None:
             return False, code, redact_secrets(message, secrets)
 
-        ok, code, message = await start_connection(
+        ok, code, session, message = await start_connection(
             connection, connection_mode=self._connection_mode  # type: ignore[arg-type]
         )
-        if not ok:
+        if not ok or session is None:
             return False, code, redact_secrets(message, secrets)
 
-        self._connection = connection
-        self._robot_ip = robot_ip
+        self._session = session
+        self._connection = session
+        self._robot_ip = (
+            LOCAL_AP_IP
+            if self._connection_mode == "ap"
+            else (str(robot_ip).strip() if robot_ip else None)
+        )
         self._connected = True
+        self._published_commands = []
 
-        # Subscribe to video stream
-        try:
-            self._video_sub = connection.video_stream().subscribe(self._on_video)
-        except Exception as exc:  # noqa: BLE001
-            await self.disconnect()
-            return False, "CAMERA_NOT_READY", f"Video subscribe failed: {exc}"
+        if not session.enable_video(self._on_av_frame):
+            logger.warning("Video channel enable failed at connect")
 
-        # Wait briefly for first frame
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and self._latest_frame is None:
-            time.sleep(0.05)
+            await asyncio.sleep(0.05)
 
         if self._latest_frame is None:
             logger.warning("Connected but no camera frame yet")
 
-        # Best-effort standup / balance (matches GO2Connection.start behavior)
-        try:
-            if hasattr(connection, "standup"):
-                connection.standup()
-            if hasattr(connection, "balance_stand"):
-                connection.balance_stand()
-        except Exception:  # noqa: BLE001
-            logger.warning("standup/balance_stand failed", exc_info=True)
-
+        # Never auto-standup here — preflight and connect must remain no-motion.
         det_ok = self._init_detector()
         if not det_ok:
             logger.warning("Detector not ready; follow acquisition will fail until available")
 
-        return True, "OK", f"Connected to {robot_ip} via DimOS WebRTC"
+        mode_label = "LocalAP" if self._connection_mode == "ap" else "LocalSTA"
+        return True, "OK", f"Connected via {mode_label} (AES authenticated)"
+
+    def _on_av_frame(self, frame: Any) -> None:
+        try:
+            array = frame.to_ndarray(format="rgb24")
+            height, width = int(array.shape[0]), int(array.shape[1])
+        except Exception:  # noqa: BLE001
+            logger.debug("frame convert failed", exc_info=True)
+            return
+        with self._lock:
+            self._frame_counter += 1
+            self._latest_frame = CameraFrame(
+                image=array,
+                timestamp_s=time.monotonic(),
+                frame_id=self._frame_counter,
+                encoding="rgb",
+                width=width,
+                height=height,
+            )
 
     def _init_detector(self) -> bool:
         # Prefer DimOS Yolo2DDetector; fall back to ultralytics directly
@@ -213,24 +234,109 @@ class DimOSGo2Adapter:
     async def disconnect(self) -> tuple[bool, str, str]:
         self.stop_follow()
         self.publish_zero()
-        sub = self._video_sub
-        self._video_sub = None
-        if sub is not None:
-            try:
-                sub.dispose()
-            except Exception:  # noqa: BLE001
-                pass
-        conn = self._connection
+        session = self._session
+        self._session = None
         self._connection = None
         self._connected = False
-        if conn is not None:
+        if session is not None:
             try:
-                if hasattr(conn, "stop_movement"):
-                    conn.stop_movement()
-                conn.stop()
+                session.close()
             except Exception as exc:  # noqa: BLE001
                 return False, "CONNECTION_LOST", f"Disconnect error: {exc}"
         return True, "OK", "disconnected"
+
+    async def run_preflight(
+        self,
+        robot_ip: str | None = None,
+        *,
+        frame_advance_s: float = 5.0,
+    ) -> dict[str, Any]:
+        """NO-MOTION preflight. Never publishes non-zero velocity."""
+        from singularity_go2_console.webrtc_connect import LOCAL_AP_IP
+
+        target_ip = (
+            LOCAL_AP_IP
+            if self._connection_mode == "ap"
+            else (robot_ip or self._robot_ip)
+        )
+        out: dict[str, Any] = {
+            "connection_mode": self._connection_mode,
+            "robot_ip": target_ip,
+            "nonzero_velocity_sent": False,
+            "commands": [],
+        }
+        disconnected = False
+        try:
+            ok, code, message = await self.connect(
+                None if self._connection_mode == "ap" else target_ip
+            )
+            out["connect"] = {"ok": ok, "code": code, "message": message}
+            out["aes_authenticated"] = bool(ok)
+            if not ok:
+                out["ok"] = False
+                out["error_code"] = code
+                return out
+
+            out["data_channel"] = {
+                "ok": bool(self._session and self._session.datachannel_ok)
+            }
+            out["velocity_channel"] = {
+                "ok": bool(self._session and self._session.velocity_channel_ok)
+            }
+            if not out["data_channel"]["ok"]:
+                out["ok"] = False
+                out["error_code"] = "WEBRTC_DATA_CHANNEL_FAILED"
+                return out
+            if not out["velocity_channel"]["ok"]:
+                out["ok"] = False
+                out["error_code"] = "VELOCITY_CHANNEL_UNAVAILABLE"
+                return out
+
+            start_id = self._latest_frame.frame_id if self._latest_frame else None
+            deadline = time.monotonic() + frame_advance_s
+            advanced = False
+            while time.monotonic() < deadline:
+                frame = self.get_latest_frame()
+                if frame is not None and start_id is not None and frame.frame_id > start_id:
+                    advanced = True
+                    break
+                if frame is not None and start_id is None:
+                    start_id = frame.frame_id
+                await asyncio.sleep(0.05)
+            end_frame = self.get_latest_frame()
+            out["camera"] = {
+                "ready": end_frame is not None,
+                "start_frame_id": start_id,
+                "end_frame_id": getattr(end_frame, "frame_id", None),
+                "frames_advanced": advanced,
+            }
+            if not advanced:
+                out["ok"] = False
+                out["error_code"] = "CAMERA_STREAM_UNAVAILABLE"
+                return out
+
+            zero_ok = self.publish_zero()
+            stop_ok = bool(self._session and self._session.stop_movement())
+            out["zero_velocity"] = zero_ok
+            out["stop_path"] = stop_ok
+            out["commands"] = list(self._published_commands)
+            out["nonzero_velocity_sent"] = any(
+                abs(vx) > 1e-12 or abs(vy) > 1e-12 or abs(wz) > 1e-12
+                for vx, vy, wz in self._published_commands
+            )
+            if out["nonzero_velocity_sent"] or not zero_ok or not stop_ok:
+                out["ok"] = False
+                out["error_code"] = "VELOCITY_CHANNEL_UNAVAILABLE"
+                return out
+            out["ok"] = True
+            return out
+        finally:
+            try:
+                await self.disconnect()
+                disconnected = True
+            except Exception as exc:  # noqa: BLE001
+                out["disconnect_error"] = str(exc)
+            out["disconnected"] = disconnected
 
     def get_latest_frame(self) -> CameraFrame | None:
         with self._lock:
@@ -291,7 +397,6 @@ class DimOSGo2Adapter:
                 or "person"
             ).lower()
             if "person" not in name and name not in {"0", "person"}:
-                # Some detectors use class id 0
                 class_id = getattr(det, "class_id", None)
                 if class_id not in (0, "0", None):
                     if name and name != "person":
@@ -317,33 +422,16 @@ class DimOSGo2Adapter:
         return out
 
     def publish_velocity(self, vx: float, vy: float, wz: float) -> bool:
-        if self._connection is None:
+        if self._session is None:
             return False
-        try:
-            from dimos.msgs.geometry_msgs.Twist import Twist
-            from dimos.msgs.geometry_msgs.Vector3 import Vector3
-
-            twist = Twist()
-            twist.linear = Vector3(vx, vy, 0.0)
-            twist.angular = Vector3(0.0, 0.0, wz)
-            return bool(self._connection.move(twist))
-        except Exception:
-            logger.exception("publish_velocity failed")
-            return False
+        self._published_commands.append((float(vx), float(vy), float(wz)))
+        return bool(self._session.move(vx, vy, wz))
 
     def publish_zero(self) -> bool:
-        if self._connection is None:
+        if self._session is None:
             return False
-        try:
-            if hasattr(self._connection, "stop_movement"):
-                self._connection.stop_movement()
-            return self.publish_velocity(0.0, 0.0, 0.0)
-        except Exception:
-            logger.exception("publish_zero failed")
-            try:
-                return self.publish_velocity(0.0, 0.0, 0.0)
-            except Exception:
-                return False
+        self._published_commands.append((0.0, 0.0, 0.0))
+        return bool(self._session.stop_movement())
 
 
     def encode_frame_jpeg_bytes(self, frame: CameraFrame) -> bytes | None:

@@ -211,64 +211,82 @@ def _ping(ip: str, count: int = 2) -> bool:
 
 @app.command()
 def preflight(
-    robot_ip: str = typer.Option(..., "--robot-ip", help="Go2 IP address"),
     connection_mode: str = typer.Option("ap", "--connection-mode", help="ap|sta"),
+    robot_ip: Optional[str] = typer.Option(None, "--robot-ip", help="Required for STA"),
     aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file", help="AES key file"),
 ) -> None:
     """Connectivity checks. Must not send non-zero movement."""
     console.print(SAFETY_WARNING)
-    results: dict[str, Any] = {"robot_ip": robot_ip}
+    from singularity_go2_console.aes import AesKeyError
+    from singularity_go2_console.config import DEFAULT_AP_IP
 
-    results["ping"] = _ping(robot_ip)
-    # Latency sample
-    start = asyncio.get_event_loop_policy().new_event_loop().time() if False else None
-    import time
-
-    t0 = time.perf_counter()
-    results["ping"] = _ping(robot_ip, count=1)
-    results["ping_latency_s"] = time.perf_counter() - t0
-
-    cfg = _load_config(robot_ip=robot_ip, mock=False, connection_mode=connection_mode, aes_key_file=aes_key_file)
-    # Import check only unless DimOS present
-    from singularity_go2_console.dimos_adapter import dimos_available
-
-    ok, detail = dimos_available()
-    results["dimos"] = {"ok": ok, "detail": detail}
-    if not ok:
+    results: dict[str, Any] = {
+        "connection_mode": connection_mode,
+        "robot_ip": robot_ip,
+        "aes_key_file": aes_key_file,
+    }
+    if connection_mode.strip().lower() == "sta" and not robot_ip and not os.environ.get("ROBOT_IP"):
+        results["ok"] = False
+        results["error_code"] = "STA_ROBOT_IP_REQUIRED"
+        results["message"] = "STA mode requires --robot-ip"
         console.print(json.dumps(results, indent=2))
-        console.print("[red]DimOS not available — cannot complete WebRTC preflight[/red]")
         raise typer.Exit(code=2)
+
+    try:
+        cfg = _load_config(
+            robot_ip=robot_ip,
+            mock=False,
+            connection_mode=connection_mode,
+            aes_key_file=aes_key_file,
+        )
+        cfg.resolve_aes(require=True)
+    except AesKeyError as exc:
+        results["ok"] = False
+        results["error_code"] = exc.code
+        results["message"] = str(exc)
+        console.print(json.dumps(results, indent=2))
+        raise typer.Exit(code=2)
+
+    if cfg.connection_mode == "sta" and not cfg.robot_ip:
+        results["ok"] = False
+        results["error_code"] = "STA_ROBOT_IP_REQUIRED"
+        console.print(json.dumps(results, indent=2))
+        raise typer.Exit(code=2)
+
+    if cfg.connection_mode == "sta" and cfg.robot_ip:
+        import time
+
+        t0 = time.perf_counter()
+        results["ping"] = _ping(cfg.robot_ip, count=1)
+        results["ping_latency_s"] = time.perf_counter() - t0
+    else:
+        results["robot_ip"] = cfg.robot_ip or DEFAULT_AP_IP
 
     async def _run() -> dict[str, Any]:
         from singularity_go2_console.dimos_adapter import DimOSGo2Adapter
 
-        adapter = DimOSGo2Adapter()
-        out: dict[str, Any] = dict(results)
-        conn_ok, code, msg = await adapter.connect(robot_ip)
-        out["webrtc"] = {"ok": conn_ok, "code": code, "message": msg}
-        if not conn_ok:
-            return out
-        frame = adapter.get_latest_frame()
-        out["camera"] = {
-            "ready": frame is not None,
-            "width": getattr(frame, "width", None),
-            "height": getattr(frame, "height", None),
-            "frame_id": getattr(frame, "frame_id", None),
-        }
-        # Zero-velocity path only
-        zero_ok = adapter.publish_zero()
-        out["zero_velocity"] = zero_ok
-        out["velocity_ready"] = adapter.velocity_ready
-        await adapter.disconnect()
-        return out
+        adapter = DimOSGo2Adapter(
+            connection_mode=cfg.connection_mode,
+            aes_key=cfg.aes_key.value if cfg.aes_key else None,
+            detector_model=cfg.detector_model,
+            detection_confidence=cfg.detection_confidence,
+        )
+        if adapter.mock:
+            raise RuntimeError("Refusing mock adapter in real preflight")
+        out = await adapter.run_preflight(cfg.robot_ip)
+        merged = dict(results)
+        merged.update(out)
+        merged.pop("aes_128_key", None)
+        return merged
 
     out = asyncio.run(_run())
-    console.print(json.dumps(out, indent=2))
-    if not out.get("webrtc", {}).get("ok"):
+    console.print(json.dumps(out, indent=2, default=str))
+    if out.get("nonzero_velocity_sent"):
+        console.print("[red]preflight sent non-zero velocity[/red]")
+        raise typer.Exit(code=4)
+    if not out.get("ok"):
+        console.print(f"[red]preflight failed: {out.get('error_code')}[/red]")
         raise typer.Exit(code=2)
-    if not out.get("zero_velocity"):
-        console.print("[red]Zero velocity path failed[/red]")
-        raise typer.Exit(code=3)
     console.print("[green]preflight ok (no non-zero movement sent)[/green]")
 
 
@@ -278,12 +296,18 @@ async def _start_session(
     open_console: bool,
 ) -> int:
     console.print(SAFETY_WARNING)
-    if not cfg.robot_ip and not cfg.mock:
-        console.print("[red]ROBOT_IP / --robot-ip required for real mode[/red]")
+    if not cfg.mock and cfg.connection_mode == "sta" and not cfg.robot_ip:
+        console.print("[red]STA mode requires --robot-ip[/red]")
         return 2
+    if not cfg.mock:
+        try:
+            cfg.resolve_aes(require=True)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]{exc}[/red]")
+            return 2
 
     controller = _build_controller(cfg)
-    ip = cfg.robot_ip or "127.0.0.1"
+    ip = cfg.robot_ip
     result = await controller.connect(ip)
     if not result.ok:
         console.print(f"[red]connect failed: {result.code.value} {result.message}[/red]")
@@ -312,6 +336,8 @@ async def _start_session(
 @app.command()
 def start(
     robot_ip: Optional[str] = typer.Option(None, "--robot-ip"),
+    connection_mode: str = typer.Option("ap", "--connection-mode", help="ap|sta"),
+    aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file"),
     mode: str = typer.Option("follow", "--mode", help="idle|manual|follow"),
     mock: bool = typer.Option(False, "--mock", help="Explicit mock mode"),
     detect_only: bool = typer.Option(False, "--detect-only"),
@@ -325,6 +351,8 @@ def start(
         mock=mock,
         detect_only=detect_only,
         tracker_only=tracker_only,
+        connection_mode=connection_mode,
+        aes_key_file=aes_key_file,
     )
     raise typer.Exit(asyncio.run(_start_session(cfg, open_console=not no_console)))
 
@@ -332,31 +360,55 @@ def start(
 @app.command(name="console")
 def console_cmd(
     robot_ip: Optional[str] = typer.Option(None, "--robot-ip"),
+    connection_mode: str = typer.Option("ap", "--connection-mode", help="ap|sta"),
+    aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file"),
     mode: str = typer.Option("manual", "--mode"),
     mock: bool = typer.Option(False, "--mock"),
 ) -> None:
     """Interactive terminal console."""
-    cfg = _load_config(robot_ip=robot_ip, mode=mode, mock=mock)
+    cfg = _load_config(
+        robot_ip=robot_ip,
+        mode=mode,
+        mock=mock,
+        connection_mode=connection_mode,
+        aes_key_file=aes_key_file,
+    )
     raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
 
 
 @app.command()
 def manual(
     robot_ip: Optional[str] = typer.Option(None, "--robot-ip"),
+    connection_mode: str = typer.Option("ap", "--connection-mode", help="ap|sta"),
+    aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file"),
     mock: bool = typer.Option(False, "--mock"),
 ) -> None:
     """Start in manual teleop mode."""
-    cfg = _load_config(robot_ip=robot_ip, mode="manual", mock=mock)
+    cfg = _load_config(
+        robot_ip=robot_ip,
+        mode="manual",
+        mock=mock,
+        connection_mode=connection_mode,
+        aes_key_file=aes_key_file,
+    )
     raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
 
 
 @app.command()
 def follow(
     robot_ip: Optional[str] = typer.Option(None, "--robot-ip"),
+    connection_mode: str = typer.Option("ap", "--connection-mode", help="ap|sta"),
+    aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file"),
     mock: bool = typer.Option(False, "--mock"),
 ) -> None:
     """Start automatic front-person follow."""
-    cfg = _load_config(robot_ip=robot_ip, mode="follow", mock=mock)
+    cfg = _load_config(
+        robot_ip=robot_ip,
+        mode="follow",
+        mock=mock,
+        connection_mode=connection_mode,
+        aes_key_file=aes_key_file,
+    )
     raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
 
 

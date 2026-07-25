@@ -99,6 +99,11 @@ def redact_secrets(text: str, secrets: list[str] | tuple[str, ...] = ()) -> str:
     """Replace known secret substrings before logging or returning errors."""
     redacted = text
     for secret in secrets:
-        if secret and secret in redacted:
+        if not secret:
+            continue
+        if secret in redacted:
             redacted = redacted.replace(secret, "<redacted>")
+        prefix = secret[:8]
+        if len(prefix) >= 8 and prefix in redacted:
+            redacted = redacted.replace(prefix, "<redacted>")
     return redacted

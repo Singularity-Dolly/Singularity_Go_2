@@ -152,7 +152,7 @@ class Go2Controller:
     # Public API
     # ------------------------------------------------------------------
 
-    async def connect(self, robot_ip: str) -> ControllerResult:
+    async def connect(self, robot_ip: str | None = None) -> ControllerResult:
         self._last_command = "connect"
         if not self.adapter.mock and self.config.mock is False:
             # Real mode must never silently use a mock adapter
@@ -161,6 +161,14 @@ class Go2Controller:
                     ErrorCode.INTERNAL_ERROR,
                     "Real mode refused mock adapter",
                 )
+
+        mode = (getattr(self.config, "connection_mode", None) or "ap")
+        mode = str(mode).lower()
+        if mode == "sta" and not (robot_ip or self.config.robot_ip):
+            return ControllerResult.failure(
+                ErrorCode.STA_ROBOT_IP_REQUIRED,
+                "STA mode requires --robot-ip",
+            )
 
         tr = await self._transition(ControllerMode.CONNECTING)
         if not tr.ok and self._mode != ControllerMode.DISCONNECTED:
@@ -173,12 +181,22 @@ class Go2Controller:
             with self._lock:
                 self._mode = ControllerMode.CONNECTING
 
-        self._robot_ip = robot_ip
-        self._emit(EventType.ROBOT_CONNECTING, robot_ip=robot_ip)
-        log_event("robot_connect_start", robot_ip=robot_ip, mode=self._mode.value)
+        resolved_ip = robot_ip if robot_ip is not None else self.config.robot_ip
+        if mode == "ap" and not resolved_ip:
+            resolved_ip = "192.168.12.1"
+        self._robot_ip = resolved_ip
+        self._emit(EventType.ROBOT_CONNECTING, robot_ip=resolved_ip)
+        log_event(
+            "robot_connect_start",
+            robot_ip=resolved_ip,
+            mode=self._mode.value,
+            connection_mode=mode,
+        )
 
         try:
-            ok, code, message = await self.adapter.connect(robot_ip)
+            ok, code, message = await self.adapter.connect(
+                None if mode == "ap" else resolved_ip
+            )
         except Exception as exc:  # noqa: BLE001 — boundary conversion
             await self._transition(ControllerMode.ERROR)
             self._set_error(ErrorCode.WEBRTC_CONNECTION_FAILED, str(exc))
@@ -203,14 +221,14 @@ class Go2Controller:
         if frame is not None:
             self._watchdogs.mark_frame()
             self._emit(EventType.CAMERA_READY, frame_id=frame.frame_id)
-            log_event("camera_first_frame", robot_ip=robot_ip, mode="IDLE")
+            log_event("camera_first_frame", robot_ip=resolved_ip, mode="IDLE")
 
         with self._lock:
             self._mode = ControllerMode.IDLE
             self._mux.set_owner(VelocityOwner.NONE)
-        self._emit(EventType.ROBOT_CONNECTED, robot_ip=robot_ip)
-        log_event("robot_connected", robot_ip=robot_ip, mode="IDLE", result="ok")
-        return ControllerResult.success(message=message, robot_ip=robot_ip)
+        self._emit(EventType.ROBOT_CONNECTED, robot_ip=resolved_ip)
+        log_event("robot_connected", robot_ip=resolved_ip, mode="IDLE", result="ok")
+        return ControllerResult.success(message=message, robot_ip=resolved_ip)
 
     async def disconnect(self) -> ControllerResult:
         self._last_command = "disconnect"

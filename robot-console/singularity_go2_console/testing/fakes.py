@@ -167,10 +167,10 @@ class FakeGo2Adapter:
     def follow_ready(self) -> bool:
         return self.connected
 
-    async def connect(self, robot_ip: str) -> tuple[bool, str, str]:
+    async def connect(self, robot_ip: str | None = None) -> tuple[bool, str, str]:
         if self.fail_connect:
             return False, "WEBRTC_CONNECTION_FAILED", "fake connect failed"
-        self._robot_ip = robot_ip
+        self._robot_ip = robot_ip or "127.0.0.1"
         self._connected = True
         self.camera.push()
         return True, "OK", f"connected to {robot_ip}"

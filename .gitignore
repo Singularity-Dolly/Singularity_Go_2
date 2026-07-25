@@ -26,3 +26,6 @@ aes_key
 *.aes
 robot-service.env
 .config/go2ctl/
+.go2ctl-logs/
+.dimos-logs/
+.secrets/

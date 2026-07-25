@@ -38,7 +38,7 @@ class Go2Adapter(Protocol):
     @property
     def follow_ready(self) -> bool: ...
 
-    async def connect(self, robot_ip: str) -> tuple[bool, str, str]:
+    async def connect(self, robot_ip: str | None = None) -> tuple[bool, str, str]:
         """Return (ok, code, message)."""
         ...
 
