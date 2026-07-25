@@ -348,18 +348,8 @@ class Go2WebRTCSession:
             )
         from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD
 
-        # Unitree MotionSwitcher: release active mode, then select normal.
-        try:
-            await asyncio.wait_for(
-                self.conn.datachannel.pub_sub.publish_request_new(
-                    RTC_TOPIC["MOTION_SWITCHER"],
-                    {"api_id": MOTION_SWITCHER_RELEASE_MODE},
-                ),
-                timeout=2.0,
-            )
-        except Exception:  # noqa: BLE001
-            logger.debug("motion ReleaseMode failed/ignored", exc_info=True)
-
+        # Do NOT call MotionSwitcher ReleaseMode (1003) — that often drops the
+        # robot into damp/lie. Only SelectMode("normal").
         await asyncio.wait_for(
             self.conn.datachannel.pub_sub.publish_request_new(
                 RTC_TOPIC["MOTION_SWITCHER"],

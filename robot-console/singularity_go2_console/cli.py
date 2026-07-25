@@ -479,6 +479,31 @@ def follow(
 
 
 @app.command()
+def wasd(
+    aes_key_file: Optional[str] = typer.Option(
+        str(Path.home() / ".config/go2ctl/aes_key"),
+        "--aes-key-file",
+    ),
+) -> None:
+    """Minimal WASD walker (AP). No follow/detector — just walk."""
+    console.print(SAFETY_WARNING)
+    console.print(
+        "Launching minimal walker…\n"
+        "After BalanceStand, type w/a/s/d + Enter."
+    )
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "go2_wasd.py"
+    )
+    # Re-exec so the script owns the asyncio loop cleanly.
+    os.environ["GO2CTL_AES_KEY_FILE"] = aes_key_file or ""
+    raise typer.Exit(
+        subprocess.call(  # noqa: S603
+            [sys.executable, str(script)],
+        )
+    )
+
+
+@app.command()
 def hold() -> None:
     """Best-effort hold via local control socket is not used; use console X or API later."""
     console.print(
