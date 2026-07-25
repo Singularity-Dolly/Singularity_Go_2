@@ -17,7 +17,7 @@ Verified on the actual Unitree Go2 (independent of this go2ctl preflight run):
 - `--connection-mode ap|sta` and `--aes-key-file` on `preflight` / `start` / `console`
 - AES priority: CLI file → `UNITREE_AES_128_KEY` → `~/.config/go2ctl/aes_key`
 - Exact LocalAP / LocalSTA constructors via `unitree_webrtc_connect`
-- unit tests: **61 passed**
+- unit tests: **67 passed**
 
 ## Latest go2ctl preflight attempt (this workspace)
 

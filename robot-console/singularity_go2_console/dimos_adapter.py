@@ -324,7 +324,12 @@ class DimOSGo2Adapter:
                 abs(vx) > 1e-12 or abs(vy) > 1e-12 or abs(wz) > 1e-12
                 for vx, vy, wz in self._published_commands
             )
-            if out["nonzero_velocity_sent"] or not zero_ok or not stop_ok:
+            if out["nonzero_velocity_sent"]:
+                out["ok"] = False
+                out["error_code"] = "INTERNAL_ERROR"
+                out["message"] = "preflight sent non-zero velocity — abort"
+                return out
+            if not zero_ok or not stop_ok:
                 out["ok"] = False
                 out["error_code"] = "VELOCITY_CHANNEL_UNAVAILABLE"
                 return out

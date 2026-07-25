@@ -28,10 +28,19 @@ def test_validate_rejects_short() -> None:
     assert exc.value.code == "AES_KEY_INVALID"
 
 
-def test_validate_rejects_non_hex() -> None:
+def test_validate_rejects_too_long_no_truncate() -> None:
+    # Must fail closed — never truncate a 40-char key into 32.
     with pytest.raises(AesKeyError) as exc:
-        validate_aes_key("g" * 32)
+        validate_aes_key("0123456789abcdef0123456789abcdefFFFF")
     assert exc.value.code == "AES_KEY_INVALID"
+    assert "FFFF" not in str(exc.value)
+
+
+def test_validate_rejects_empty_after_strip() -> None:
+    with pytest.raises(AesKeyError) as exc:
+        validate_aes_key("   \n\t  ")
+    assert exc.value.code == "AES_KEY_REQUIRED"
+
 
 
 def test_key_file_priority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

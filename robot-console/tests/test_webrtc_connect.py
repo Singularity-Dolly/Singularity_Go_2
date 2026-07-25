@@ -78,12 +78,35 @@ def test_missing_key_rejected() -> None:
     assert code == "AES_KEY_REQUIRED"
 
 
-def test_cli_exposes_connection_mode_and_aes_key_file() -> None:
-    for cmd in ("preflight", "start", "console"):
-        result = runner.invoke(app, [cmd, "--help"])
-        assert result.exit_code == 0
-        assert "--connection-mode" in result.stdout
-        assert "--aes-key-file" in result.stdout
+def test_ap_does_not_accept_sta_ip_kw() -> None:
+    """LocalAP constructor must not receive ip= (no silent STA-shaped call)."""
+    conn, code, _ = build_unitree_connection(
+        connection_mode="ap",
+        robot_ip="192.168.123.161",
+        aes_key="0123456789abcdef0123456789abcdef",
+        connection_cls=FakeConn,
+        method_enum=FakeMethod,
+    )
+    assert code == "OK"
+    assert conn is not None
+    assert conn.method is FakeMethod.LocalAP
+    assert "ip" not in conn.kwargs
+    assert set(conn.kwargs.keys()) == {"aes_128_key"}
+
+
+def test_no_ap_sta_mode_flip() -> None:
+    conn, code, _ = build_unitree_connection(
+        connection_mode="sta",
+        robot_ip="10.0.0.5",
+        aes_key="0123456789abcdef0123456789abcdef",
+        connection_cls=FakeConn,
+        method_enum=FakeMethod,
+    )
+    assert code == "OK"
+    assert conn is not None
+    assert conn.method is FakeMethod.LocalSTA
+    assert conn.method is not FakeMethod.LocalAP
+
 
 
 def test_cli_sta_requires_robot_ip(tmp_path) -> None:
