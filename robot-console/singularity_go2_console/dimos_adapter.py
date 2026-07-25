@@ -24,7 +24,13 @@ import time
 from typing import Any
 
 from singularity_go2_console.adapter_protocol import FollowInit
-from singularity_go2_console.front_person import CameraFrame, PersonDetection
+from singularity_go2_console.face_tracker import FaceTracker
+from singularity_go2_console.front_person import CameraFrame, PersonDetection, bbox_area
+from singularity_go2_console.yolo_follow_control import (
+    YoloFollowParams,
+    YoloFollowState,
+    compute_yolo_follow_cmd,
+)
 
 logger = logging.getLogger("go2ctl.dimos_adapter")
 
@@ -95,6 +101,10 @@ class DimOSGo2Adapter:
         self._published_commands: list[tuple[float, float, float]] = []
         self.last_velocity_error_code: str | None = None
         self.last_velocity_error_message: str = ""
+        self._yolo_follow_state = YoloFollowState()
+        self._yolo_follow_params = YoloFollowParams()
+        self._face_tracker: FaceTracker | None = None
+        self._follow_lock_bbox: tuple[float, float, float, float] | None = None
 
     @property
     def mock(self) -> bool:
@@ -650,6 +660,9 @@ class DimOSGo2Adapter:
         self._target_visible = True
         self._visual_servo = None
         self._tracker = None
+        self._follow_lock_bbox = tuple(float(x) for x in init.bbox)  # type: ignore[assignment]
+        if self._face_tracker is None:
+            self._face_tracker = FaceTracker()
         width = int(init.frame.width or 640)
         height = int(init.frame.height or 480)
         self._follow_thread = threading.Thread(
@@ -658,19 +671,66 @@ class DimOSGo2Adapter:
             daemon=True,
         )
         self._follow_thread.start()
-        msg = "YOLO bbox follow started"
+        face_note = "face+head" if self._face_tracker.ready else "head-proxy"
+        msg = f"Smooth YOLO follow started ({face_note} aim)"
         if edge_err:
             msg += f" (EdgeTAM fallback: {edge_err})"
         return True, "OK", msg
 
+    @staticmethod
+    def _iou(
+        a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+    ) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0.0:
+            return 0.0
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def _pick_locked_person(
+        self, dets: list[PersonDetection]
+    ) -> PersonDetection | None:
+        if not dets:
+            return None
+        lock = self._follow_lock_bbox
+        if lock is None:
+            best = max(dets, key=lambda d: bbox_area(d.bbox))
+            self._follow_lock_bbox = best.bbox
+            return best
+        scored = [(self._iou(lock, d.bbox), d) for d in dets]
+        scored.sort(key=lambda t: t[0], reverse=True)
+        iou, best = scored[0]
+        if iou >= 0.15:
+            # Soft lock update (EMA-like blend) to avoid box jumps.
+            lx1, ly1, lx2, ly2 = lock
+            bx1, by1, bx2, by2 = best.bbox
+            a = 0.35
+            self._follow_lock_bbox = (
+                (1 - a) * lx1 + a * bx1,
+                (1 - a) * ly1 + a * by1,
+                (1 - a) * lx2 + a * bx2,
+                (1 - a) * ly2 + a * by2,
+            )
+            return best
+        # Lost lock — retarget largest centered-ish person.
+        best = max(dets, key=lambda d: bbox_area(d.bbox))
+        self._follow_lock_bbox = best.bbox
+        return best
+
     def _yolo_follow_loop(self, image_width: int, image_height: int) -> None:
-        """Simple person follow using YOLO detections (CPU OK)."""
+        """Smooth person follow: face aim + body range + slew limits."""
         period = 1.0 / self._control_hz
         lost = 0
-        # Keep person roughly centered and at a comfortable size.
-        target_area = 0.12
-        kp_yaw = 1.2
-        kp_x = 0.8
+        self._yolo_follow_state = YoloFollowState()
+        face = self._face_tracker or FaceTracker()
+        self._face_tracker = face
         while not self._follow_stop.is_set():
             t0 = time.monotonic()
             frame = self.get_latest_frame()
@@ -680,7 +740,8 @@ class DimOSGo2Adapter:
             else:
                 try:
                     dets = self.detect_persons(frame)
-                    if not dets:
+                    person = self._pick_locked_person(dets)
+                    if person is None:
                         self._last_follow_cmd = (0.0, 0.0, 0.0)
                         self._target_visible = False
                         lost += 1
@@ -689,22 +750,16 @@ class DimOSGo2Adapter:
                     else:
                         lost = 0
                         self._target_visible = True
-                        best = max(
-                            dets,
-                            key=lambda d: max(0.0, (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1])),
+                        aim_bbox, _src = face.aim_bbox(frame.image, person.bbox)
+                        self._last_follow_cmd = compute_yolo_follow_cmd(
+                            person.bbox,
+                            image_width,
+                            image_height,
+                            time.monotonic(),
+                            self._yolo_follow_state,
+                            self._yolo_follow_params,
+                            aim_bbox=aim_bbox,
                         )
-                        x1, y1, x2, y2 = best.bbox
-                        cx = 0.5 * (x1 + x2)
-                        area = max(0.0, (x2 - x1) * (y2 - y1)) / max(
-                            1.0, float(image_width * image_height)
-                        )
-                        err_x = (cx / max(1.0, float(image_width))) - 0.5
-                        wz = max(-0.35, min(0.35, -kp_yaw * err_x))
-                        # Closer (large bbox) → slow/back; far → forward.
-                        vx = max(-0.15, min(0.45, kp_x * (target_area - area)))
-                        if abs(err_x) > 0.25:
-                            vx *= 0.35  # turn first if far off-center
-                        self._last_follow_cmd = (float(vx), 0.0, float(wz))
                 except Exception:
                     logger.exception("yolo follow loop error")
                     self._last_follow_cmd = (0.0, 0.0, 0.0)
@@ -717,6 +772,7 @@ class DimOSGo2Adapter:
         self._last_follow_cmd = (0.0, 0.0, 0.0)
         self._following = False
         self._target_visible = False
+        self._follow_lock_bbox = None
 
     def _as_dimos_image(self, frame: CameraFrame) -> Any:
         try:

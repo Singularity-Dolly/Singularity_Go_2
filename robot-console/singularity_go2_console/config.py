@@ -11,14 +11,32 @@ from singularity_go2_console.aes import AesKeyError, AesKeyMaterial, load_aes_ke
 
 ConnectionMode = Literal["ap", "sta"]
 
-# Hard safety caps for AdventureX physical demo.
+# Hard safety caps for AdventureX physical demo (manual teleop).
 MAX_LINEAR_MPS = 0.15
 MAX_YAW_RPS = 0.35
+# Follow may match ordinary walk pace (still below jog).
+FOLLOW_MAX_LINEAR_MPS = 0.45
+FOLLOW_MAX_YAW_RPS = 0.55
 DEFAULT_AP_IP = "192.168.12.1"
 DEFAULT_KEY_HOLD_MS = 400
 MIN_KEY_HOLD_MS = 150
 MAX_KEY_HOLD_MS = 1000
 TELEOP_PUBLISH_HZ = 20.0
+
+
+def default_detector_model() -> str:
+    """Prefer on-disk yolov8n.pt so follow does not re-download weights."""
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parents[1] / "models" / "yolov8n.pt",
+        Path.cwd() / "robot-console" / "models" / "yolov8n.pt",
+        Path.cwd() / "weights" / "yolov8n.pt",
+        Path.cwd() / "yolov8n.pt",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+    return "yolov8n.pt"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -90,6 +108,10 @@ class Go2CtlConfig:
     max_reverse_speed: float = MAX_LINEAR_MPS
     max_strafe_speed: float = MAX_LINEAR_MPS
     max_angular_speed: float = MAX_YAW_RPS
+    follow_max_forward_speed: float = FOLLOW_MAX_LINEAR_MPS
+    follow_max_reverse_speed: float = FOLLOW_MAX_LINEAR_MPS
+    follow_max_strafe_speed: float = FOLLOW_MAX_LINEAR_MPS
+    follow_max_angular_speed: float = FOLLOW_MAX_YAW_RPS
     slow_multiplier: float = 0.5
     boost_multiplier: float = 1.5
     mode_settle_ms: int = 80
@@ -150,6 +172,22 @@ class Go2CtlConfig:
             MAX_LINEAR_MPS, _env_float("GO2CTL_MAX_STRAFE_SPEED", MAX_LINEAR_MPS)
         )
         yaw = min(MAX_YAW_RPS, _env_float("GO2CTL_MAX_ANGULAR_SPEED", MAX_YAW_RPS))
+        follow_fwd = min(
+            FOLLOW_MAX_LINEAR_MPS,
+            _env_float("GO2CTL_FOLLOW_MAX_FORWARD_SPEED", FOLLOW_MAX_LINEAR_MPS),
+        )
+        follow_rev = min(
+            FOLLOW_MAX_LINEAR_MPS,
+            _env_float("GO2CTL_FOLLOW_MAX_REVERSE_SPEED", FOLLOW_MAX_LINEAR_MPS),
+        )
+        follow_strafe = min(
+            FOLLOW_MAX_LINEAR_MPS,
+            _env_float("GO2CTL_FOLLOW_MAX_STRAFE_SPEED", FOLLOW_MAX_LINEAR_MPS),
+        )
+        follow_yaw = min(
+            FOLLOW_MAX_YAW_RPS,
+            _env_float("GO2CTL_FOLLOW_MAX_ANGULAR_SPEED", FOLLOW_MAX_YAW_RPS),
+        )
         key_hold = clamp_key_hold_ms(
             _env_int("GO2CTL_KEY_HOLD_MS", DEFAULT_KEY_HOLD_MS)
         )
@@ -160,7 +198,9 @@ class Go2CtlConfig:
             aes_key_file=aes_key_file,
             aes_key=aes,
             start_mode=os.environ.get("GO2CTL_START_MODE", "follow"),
-            detector_model=os.environ.get("GO2CTL_DETECTOR_MODEL", "yolov8n.pt"),
+            detector_model=os.environ.get(
+                "GO2CTL_DETECTOR_MODEL", default_detector_model()
+            ),
             detection_confidence=_env_float("GO2CTL_DETECTION_CONFIDENCE", 0.50),
             target_stable_frames=_env_int("GO2CTL_TARGET_STABLE_FRAMES", 3),
             acquire_timeout_s=_env_float("GO2CTL_ACQUIRE_TIMEOUT_S", 15.0),
@@ -171,6 +211,10 @@ class Go2CtlConfig:
             max_reverse_speed=reverse,
             max_strafe_speed=strafe,
             max_angular_speed=yaw,
+            follow_max_forward_speed=follow_fwd,
+            follow_max_reverse_speed=follow_rev,
+            follow_max_strafe_speed=follow_strafe,
+            follow_max_angular_speed=follow_yaw,
             log_level=os.environ.get("GO2CTL_LOG_LEVEL", "INFO"),
             mock=_env_bool("GO2CTL_MOCK", False),
             robot_id=os.environ.get("ROBOT_ID")
@@ -195,6 +239,17 @@ class Go2CtlConfig:
             cleaned["max_angular_speed"] = min(
                 MAX_YAW_RPS, float(cleaned["max_angular_speed"])
             )
+        for key in (
+            "follow_max_forward_speed",
+            "follow_max_reverse_speed",
+            "follow_max_strafe_speed",
+        ):
+            if key in cleaned:
+                cleaned[key] = min(FOLLOW_MAX_LINEAR_MPS, float(cleaned[key]))
+        if "follow_max_angular_speed" in cleaned:
+            cleaned["follow_max_angular_speed"] = min(
+                FOLLOW_MAX_YAW_RPS, float(cleaned["follow_max_angular_speed"])
+            )
         if "key_hold_ms" in cleaned:
             cleaned["key_hold_ms"] = clamp_key_hold_ms(cleaned["key_hold_ms"])
         return replace(self, **cleaned)
@@ -217,4 +272,19 @@ class Go2CtlConfig:
         vx = max(-self.max_reverse_speed, min(self.max_forward_speed, vx))
         vy = max(-self.max_strafe_speed, min(self.max_strafe_speed, vy))
         wz = max(-self.max_angular_speed, min(self.max_angular_speed, wz))
+        return vx, vy, wz
+
+    def clamp_follow_velocity(
+        self, vx: float, vy: float, wz: float
+    ) -> tuple[float, float, float]:
+        """Follow uses a higher walk-pace ceiling than manual teleop."""
+        vx = max(
+            -self.follow_max_reverse_speed, min(self.follow_max_forward_speed, vx)
+        )
+        vy = max(
+            -self.follow_max_strafe_speed, min(self.follow_max_strafe_speed, vy)
+        )
+        wz = max(
+            -self.follow_max_angular_speed, min(self.follow_max_angular_speed, wz)
+        )
         return vx, vy, wz

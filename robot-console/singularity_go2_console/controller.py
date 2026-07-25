@@ -709,7 +709,7 @@ class Go2Controller:
                 if callable(pop):
                     cmd = pop()
                     if cmd is not None:
-                        vx, vy, wz = self.config.clamp_velocity(*cmd)
+                        vx, vy, wz = self.config.clamp_follow_velocity(*cmd)
                         self._mux.publish(VelocityOwner.FOLLOW, vx, vy, wz)
 
     async def shutdown(self) -> ControllerResult:

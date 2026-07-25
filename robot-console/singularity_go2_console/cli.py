@@ -474,8 +474,9 @@ def follow(
     """Start automatic front-person follow (local YOLO + EdgeTAM AI)."""
     console.print(SAFETY_WARNING)
     console.print(
-        "Follow pipeline: camera → YOLO person detect → EdgeTAM track → walk follow.\n"
-        "Stand in front of the robot. SPACE = E-stop. ESC = quit."
+        "Follow pipeline: camera → YOLO person → face aim (YuNet) → smooth walk.\n"
+        "Stand ~1.5m in front. Walk → soft follow. Stop → robot stops.\n"
+        "SPACE = E-stop. ESC = quit."
     )
     cfg = _load_config(
         robot_ip=robot_ip,
