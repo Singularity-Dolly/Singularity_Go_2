@@ -207,13 +207,47 @@ class TestSafetyController:
         can_accept, reason = sc.can_accept_command()
         assert can_accept is True
 
-    def test_obstacle_does_not_block_commands(self) -> None:
-        """Obstacle detection does not block commands (only estop does)."""
+    def test_obstacle_blocks_motion_commands(self) -> None:
+        """Obstacle detection blocks motion commands (follow/scan/velocity)."""
         sc = SafetyController()
         sc.update_obstacle(True)
 
-        can_accept, reason = sc.can_accept_command()
-        assert can_accept is True
+        for cmd_type in ("follow", "scan", "velocity", "move"):
+            can_accept, reason = sc.can_accept_command(cmd_type)
+            assert can_accept is False, f"{cmd_type} should be blocked"
+            assert reason == RejectionReason.OBSTACLE_BLOCKING.value
+
+    def test_obstacle_allows_stop_and_query_commands(self) -> None:
+        """STOP / status / query commands always pass even with obstacle active."""
+        sc = SafetyController()
+        sc.update_obstacle(True)
+
+        for cmd_type in ("stop", "stop_all", "status", "query", None):
+            can_accept, reason = sc.can_accept_command(cmd_type)
+            assert can_accept is True, f"{cmd_type} should pass"
+            assert reason == "ok"
+
+    def test_obstacle_distance_hard_stop_overrides_boolean(self) -> None:
+        """Distance < OBSTACLE_HARD_STOP_M forces obstacle=True even if
+        the boolean detector reported False. This protects against the
+        higher-level detector failing to flag a near obstacle."""
+        sc = SafetyController()
+        # Boolean False but distance below threshold → should still block
+        sc.update_obstacle(detected=False, distance_m=0.20)
+
+        can_accept, reason = sc.can_accept_command("follow")
+        assert can_accept is False
+        assert reason == RejectionReason.OBSTACLE_BLOCKING.value
+
+    def test_obstacle_clears_when_distance_above_threshold(self) -> None:
+        """When obstacle moves away beyond hard-stop distance, motion commands
+        are accepted again."""
+        sc = SafetyController()
+        sc.update_obstacle(detected=True, distance_m=0.20)
+        assert sc.can_accept_command("follow")[0] is False
+
+        sc.update_obstacle(detected=False, distance_m=0.50)
+        assert sc.can_accept_command("follow")[0] is True
 
     def test_snapshot_reflects_state(self) -> None:
         """Snapshot includes all safety fields."""
