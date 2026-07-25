@@ -134,8 +134,9 @@ class CommandQueue:
                 robot_mode=self.current_mode,
             )
 
-        # Safety check
-        can_accept, reason = self._safety.can_accept_command()
+        # Safety check — pass command type so obstacle logic can allow STOP through.
+        cmd_type_str = command.kind.value if hasattr(command, "kind") else None
+        can_accept, reason = self._safety.can_accept_command(command_type=cmd_type_str)
         if not can_accept:
             return CommandReceipt(
                 request_id=command.request_id,
@@ -204,8 +205,9 @@ class CommandQueue:
                 robot_mode=self.current_mode,
             )
 
-        # Re-check safety
-        can_accept, reason = self._safety.can_accept_command()
+        # Re-check safety (obstacle may have appeared while waiting in queue).
+        cmd_type_str = command.kind.value if hasattr(command, "kind") else None
+        can_accept, reason = self._safety.can_accept_command(command_type=cmd_type_str)
         if not can_accept:
             return CommandReceipt(
                 request_id=command.request_id,

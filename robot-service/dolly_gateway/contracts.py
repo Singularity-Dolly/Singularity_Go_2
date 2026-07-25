@@ -54,6 +54,7 @@ class RejectionReason(_StrEnum):
     ESTOP_ACTIVE = "estop_active"
     QUEUE_FULL = "queue_full"
     UNKNOWN_COMMAND = "unknown_command"
+    OBSTACLE_BLOCKING = "obstacle_blocking"  # obstacle within hard-stop threshold
 
 
 class EventType(_StrEnum):

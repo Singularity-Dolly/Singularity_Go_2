@@ -161,8 +161,19 @@ class FrameGuard:
 class SafetyState:
     estop: bool = False
     obstacle: bool = False
+    obstacle_distance_m: float | None = None  # nearest obstacle distance, if known
     heartbeat_ok: bool = True
     last_command_age_ms: float = 0.0
+
+
+# Distance below which we hard-stop non-STOP commands. Go2 lidar reliability
+# degrades below ~0.15 m, so 0.30 m leaves one control cycle (~200 ms @
+# 5 m/s worst case) of margin before contact.
+OBSTACLE_HARD_STOP_M = 0.30
+
+# Commands that are always allowed even with obstacle active — these either
+# stop the robot or query state, never move it toward the obstacle.
+_STOP_COMMAND_TYPES = {"stop", "stop_all", "status", "query"}
 
 
 class SafetyController:
@@ -172,11 +183,15 @@ class SafetyController:
     - POST /v1/stop bypasses all queues and TTL checks
     - When estop is active, all commands are rejected
     - estop can only be cleared by explicit reset
+    - When obstacle is within OBSTACLE_HARD_STOP_M, all non-STOP commands are
+      rejected with RejectionReason.OBSTACLE_BLOCKING. STOP / status always pass.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, obstacle_stop_m: float = OBSTACLE_HARD_STOP_M) -> None:
         self._estop = False
         self._obstacle = False
+        self._obstacle_distance_m: float | None = None
+        self._obstacle_stop_m = obstacle_stop_m
         self._heartbeat_ok = True
         self._last_command_ts: float = 0.0
         self._lock = threading.Lock()
@@ -203,9 +218,27 @@ class SafetyController:
         with self._lock:
             self._estop = False
 
-    def update_obstacle(self, detected: bool) -> None:
+    def update_obstacle(self, detected: bool, distance_m: float | None = None) -> None:
+        """Update obstacle state.
+
+        - ``detected``: True if any obstacle is sensed.
+        - ``distance_m``: nearest obstacle distance in meters, if known.
+          When provided, hard-stop threshold (OBSTACLE_HARD_STOP_M) applies
+          regardless of ``detected`` — this lets lidar report "obstacle at 0.2 m"
+          without the higher-level detector needing to set ``detected=True``.
+        """
         with self._lock:
             self._obstacle = detected
+            if distance_m is not None:
+                self._obstacle_distance_m = distance_m
+                # Distance-based hard-stop overrides the boolean detector —
+                # this is the more reliable signal and protects against the
+                # detector failing to flag a near obstacle.
+                if distance_m < self._obstacle_stop_m:
+                    self._obstacle = True
+            elif not detected:
+                # Clearing the boolean should also clear a stale distance.
+                self._obstacle_distance_m = None
 
     def update_heartbeat(self, ok: bool) -> None:
         with self._lock:
@@ -215,11 +248,19 @@ class SafetyController:
         with self._lock:
             self._last_command_ts = time.monotonic()
 
-    def can_accept_command(self) -> tuple[bool, str]:
-        """Check if a command can be accepted under current safety state."""
+    def can_accept_command(self, command_type: str | None = None) -> tuple[bool, str]:
+        """Check if a command can be accepted under current safety state.
+
+        Obstacle logic:
+        - STOP / status / query commands always pass (they don't move the robot).
+        - Any motion command (follow / scan / velocity) is rejected when
+          ``_obstacle`` is True with code OBSTACLE_BLOCKING.
+        """
         with self._lock:
             if self._estop:
                 return False, RejectionReason.ESTOP_ACTIVE.value
+            if self._obstacle and command_type not in _STOP_COMMAND_TYPES:
+                return False, RejectionReason.OBSTACLE_BLOCKING.value
             return True, "ok"
 
     def snapshot(self) -> SafetyState:
@@ -230,6 +271,7 @@ class SafetyController:
             return SafetyState(
                 estop=self._estop,
                 obstacle=self._obstacle,
+                obstacle_distance_m=self._obstacle_distance_m,
                 heartbeat_ok=self._heartbeat_ok,
                 last_command_age_ms=age_ms,
             )
