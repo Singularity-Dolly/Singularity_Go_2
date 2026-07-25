@@ -15,6 +15,10 @@ ConnectionMode = Literal["ap", "sta"]
 MAX_LINEAR_MPS = 0.15
 MAX_YAW_RPS = 0.35
 DEFAULT_AP_IP = "192.168.12.1"
+DEFAULT_KEY_HOLD_MS = 400
+MIN_KEY_HOLD_MS = 150
+MAX_KEY_HOLD_MS = 1000
+TELEOP_PUBLISH_HZ = 20.0
 
 
 def _env_float(name: str, default: float) -> float:
@@ -36,6 +40,11 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def clamp_key_hold_ms(value: int | float) -> int:
+    """Clamp GO2CTL_KEY_HOLD_MS into the allowed deadman window."""
+    return int(max(MIN_KEY_HOLD_MS, min(MAX_KEY_HOLD_MS, int(value))))
 
 
 def _load_dotenv(path: Path) -> None:
@@ -76,6 +85,7 @@ class Go2CtlConfig:
     acquire_timeout_s: float = 15.0
     camera_stale_ms: int = 500
     manual_ttl_ms: int = 250
+    key_hold_ms: int = DEFAULT_KEY_HOLD_MS
     max_forward_speed: float = MAX_LINEAR_MPS
     max_reverse_speed: float = MAX_LINEAR_MPS
     max_strafe_speed: float = MAX_LINEAR_MPS
@@ -128,6 +138,7 @@ class Go2CtlConfig:
                     raise
                 aes = None
 
+        # Never silently raise speeds above hard caps via env.
         forward = min(
             MAX_LINEAR_MPS, _env_float("GO2CTL_MAX_FORWARD_SPEED", MAX_LINEAR_MPS)
         )
@@ -138,6 +149,9 @@ class Go2CtlConfig:
             MAX_LINEAR_MPS, _env_float("GO2CTL_MAX_STRAFE_SPEED", MAX_LINEAR_MPS)
         )
         yaw = min(MAX_YAW_RPS, _env_float("GO2CTL_MAX_ANGULAR_SPEED", MAX_YAW_RPS))
+        key_hold = clamp_key_hold_ms(
+            _env_int("GO2CTL_KEY_HOLD_MS", DEFAULT_KEY_HOLD_MS)
+        )
 
         return cls(
             robot_ip=robot_ip,
@@ -151,6 +165,7 @@ class Go2CtlConfig:
             acquire_timeout_s=_env_float("GO2CTL_ACQUIRE_TIMEOUT_S", 15.0),
             camera_stale_ms=_env_int("GO2CTL_CAMERA_STALE_MS", 500),
             manual_ttl_ms=_env_int("GO2CTL_MANUAL_TTL_MS", 250),
+            key_hold_ms=key_hold,
             max_forward_speed=forward,
             max_reverse_speed=reverse,
             max_strafe_speed=strafe,
@@ -176,6 +191,8 @@ class Go2CtlConfig:
             cleaned["max_angular_speed"] = min(
                 MAX_YAW_RPS, float(cleaned["max_angular_speed"])
             )
+        if "key_hold_ms" in cleaned:
+            cleaned["key_hold_ms"] = clamp_key_hold_ms(cleaned["key_hold_ms"])
         return replace(self, **cleaned)
 
     def resolve_aes(self, *, require: bool = True) -> AesKeyMaterial | None:
