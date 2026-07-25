@@ -43,15 +43,24 @@ def _load_config(
     mock: Optional[bool] = None,
     detect_only: bool = False,
     tracker_only: bool = False,
+    connection_mode: Optional[str] = None,
+    aes_key_file: Optional[str] = None,
 ) -> Go2CtlConfig:
-    cfg = Go2CtlConfig.from_environ()
-    return cfg.with_overrides(
-        robot_ip=robot_ip or cfg.robot_ip,
-        start_mode=mode or cfg.start_mode,
-        mock=cfg.mock if mock is None else mock,
-        detect_only=detect_only,
-        tracker_only=tracker_only,
-    )
+    cfg = Go2CtlConfig.from_environ(load_aes=True, require_aes=False)
+    overrides = {
+        "robot_ip": robot_ip or cfg.robot_ip,
+        "start_mode": mode or cfg.start_mode,
+        "mock": cfg.mock if mock is None else mock,
+        "detect_only": detect_only,
+        "tracker_only": tracker_only,
+    }
+    if connection_mode:
+        overrides["connection_mode"] = connection_mode
+    if aes_key_file:
+        overrides["aes_key_file"] = aes_key_file
+        from singularity_go2_console.aes import load_aes_key
+        overrides["aes_key"] = load_aes_key(key_file=aes_key_file)
+    return cfg.with_overrides(**overrides)
 
 
 def _build_controller(cfg: Go2CtlConfig) -> Go2Controller:
@@ -65,6 +74,8 @@ def _build_controller(cfg: Go2CtlConfig) -> Go2Controller:
     adapter = DimOSGo2Adapter(
         detector_model=cfg.detector_model,
         detection_confidence=cfg.detection_confidence,
+        connection_mode=cfg.connection_mode,
+        aes_key=cfg.aes_key.value if cfg.aes_key else None,
     )
     if adapter.mock:
         raise RuntimeError("Refusing mock adapter in real mode")
@@ -201,6 +212,8 @@ def _ping(ip: str, count: int = 2) -> bool:
 @app.command()
 def preflight(
     robot_ip: str = typer.Option(..., "--robot-ip", help="Go2 IP address"),
+    connection_mode: str = typer.Option("ap", "--connection-mode", help="ap|sta"),
+    aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file", help="AES key file"),
 ) -> None:
     """Connectivity checks. Must not send non-zero movement."""
     console.print(SAFETY_WARNING)
@@ -215,7 +228,7 @@ def preflight(
     results["ping"] = _ping(robot_ip, count=1)
     results["ping_latency_s"] = time.perf_counter() - t0
 
-    cfg = _load_config(robot_ip=robot_ip, mock=False)
+    cfg = _load_config(robot_ip=robot_ip, mock=False, connection_mode=connection_mode, aes_key_file=aes_key_file)
     # Import check only unless DimOS present
     from singularity_go2_console.dimos_adapter import dimos_available
 

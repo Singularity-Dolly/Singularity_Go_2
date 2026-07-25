@@ -55,12 +55,19 @@ class DimOSGo2Adapter:
         follow_skill: Any | None = None,
         max_lost_frames: int = 15,
         control_hz: float = 20.0,
+        connection_mode: str = "ap",
+        aes_key: str | None = None,
     ) -> None:
         self._detector_model = detector_model
         self._detection_confidence = detection_confidence
         self._injected_follow = follow_skill
         self._max_lost_frames = max_lost_frames
         self._control_hz = control_hz
+        mode = (connection_mode or "ap").strip().lower()
+        if mode not in {"ap", "sta"}:
+            raise ValueError("connection_mode must be ap or sta")
+        self._connection_mode = mode
+        self._aes_key = aes_key
 
         self._connected = False
         self._robot_ip: str | None = None
@@ -106,21 +113,29 @@ class DimOSGo2Adapter:
         return self.connected and ok
 
     async def connect(self, robot_ip: str) -> tuple[bool, str, str]:
-        ok, detail = dimos_available()
+        if not self._aes_key:
+            return False, "AES_KEY_REQUIRED", "AES-128 key required for Go2 firmware auth"
+
+        from singularity_go2_console.aes import redact_secrets
+        from singularity_go2_console.webrtc_connect import (
+            build_unitree_connection,
+            start_connection,
+        )
+
+        secrets = [self._aes_key]
+        connection, code, message = build_unitree_connection(
+            connection_mode=self._connection_mode,  # type: ignore[arg-type]
+            robot_ip=robot_ip,
+            aes_key=self._aes_key,
+        )
+        if connection is None:
+            return False, code, redact_secrets(message, secrets)
+
+        ok, code, message = await start_connection(
+            connection, connection_mode=self._connection_mode  # type: ignore[arg-type]
+        )
         if not ok:
-            return False, "DIMOS_NOT_AVAILABLE", f"DimOS import failed: {detail}"
-
-        try:
-            from dimos.msgs.geometry_msgs.Twist import Twist  # noqa: F401
-            from dimos.robot.unitree.connection import UnitreeWebRTCConnection
-        except Exception as exc:  # noqa: BLE001
-            return False, "UNSUPPORTED_DIMOS_VERSION", f"DimOS Go2 imports failed: {exc}"
-
-        try:
-            connection = UnitreeWebRTCConnection(robot_ip)
-            connection.start()
-        except Exception as exc:  # noqa: BLE001
-            return False, "WEBRTC_CONNECTION_FAILED", f"WebRTC connect failed: {exc}"
+            return False, code, redact_secrets(message, secrets)
 
         self._connection = connection
         self._robot_ip = robot_ip
@@ -329,6 +344,22 @@ class DimOSGo2Adapter:
                 return self.publish_velocity(0.0, 0.0, 0.0)
             except Exception:
                 return False
+
+
+    def encode_frame_jpeg_bytes(self, frame: CameraFrame) -> bytes | None:
+        try:
+            from turbojpeg import TurboJPEG
+            return TurboJPEG().encode(frame.image)
+        except Exception:
+            pass
+        try:
+            import cv2
+            ok, buf = cv2.imencode(".jpg", frame.image)
+            if not ok:
+                return None
+            return buf.tobytes()
+        except Exception:
+            return None
 
     def encode_frame_jpeg_b64(self, frame: CameraFrame) -> str:
         """Encode the exact detection frame as base64 JPEG for follow_person.

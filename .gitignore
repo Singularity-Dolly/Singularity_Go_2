@@ -22,3 +22,7 @@ Thumbs.db
 # Environment
 .env
 .env.local
+aes_key
+*.aes
+robot-service.env
+.config/go2ctl/

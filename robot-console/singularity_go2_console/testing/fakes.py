@@ -180,6 +180,14 @@ class FakeGo2Adapter:
         self.follow.started = False
         return True, "OK", "disconnected"
 
+    def encode_frame_jpeg_bytes(self, frame: CameraFrame) -> bytes | None:
+        return b"\xff\xd8\xff\xd9"
+
+    def encode_frame_jpeg_b64(self, frame: CameraFrame) -> str:
+        import base64
+        data = self.encode_frame_jpeg_bytes(frame) or b""
+        return base64.b64encode(data).decode("ascii")
+
     def get_latest_frame(self) -> CameraFrame | None:
         if not self.connected:
             return None
