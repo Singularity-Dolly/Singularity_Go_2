@@ -28,11 +28,11 @@ from singularity_go2_console.aes import load_aes_key
 from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD, WebRTCConnectionMethod
 from unitree_webrtc_connect.webrtc_driver import UnitreeWebRTCConnection
 
-# Hard safety caps (AdventureX demo).
-MAX_X = 0.15
-MAX_Y = 0.15
-MAX_Z = 0.35
-HOLD_S = 0.8
+# Ordinary walking speed (not the ultra-slow 0.15 demo crawl).
+MAX_X = 0.45
+MAX_Y = 0.30
+MAX_Z = 0.80
+HOLD_S = 1.0
 RATE_HZ = 15.0
 
 
