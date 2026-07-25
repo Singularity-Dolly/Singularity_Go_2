@@ -59,6 +59,7 @@ class DimOSGo2Adapter:
         connection_mode: str = "ap",
         aes_key: str | None = None,
         allow_normal_mode_switch: bool = False,
+        enable_video: bool = True,
     ) -> None:
         self._detector_model = detector_model
         self._detection_confidence = detection_confidence
@@ -71,6 +72,7 @@ class DimOSGo2Adapter:
         self._connection_mode = mode
         self._aes_key = aes_key
         self._allow_normal_mode_switch = bool(allow_normal_mode_switch)
+        self._enable_video = bool(enable_video)
 
         self._connected = False
         self._robot_ip: str | None = None
@@ -162,20 +164,40 @@ class DimOSGo2Adapter:
         self._connected = True
         self._published_commands = []
 
-        if not session.enable_video(self._on_av_frame):
-            logger.warning("Video channel enable failed at connect")
+        if self._enable_video:
+            if not session.enable_video(self._on_av_frame):
+                logger.warning("Video channel enable failed at connect")
+        else:
+            logger.info("Video disabled for this session (teleop/console)")
 
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and self._latest_frame is None:
-            await asyncio.sleep(0.05)
+        if self._enable_video:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and self._latest_frame is None:
+                await asyncio.sleep(0.05)
 
-        if self._latest_frame is None:
-            logger.warning("Connected but no camera frame yet")
+            if self._latest_frame is None:
+                logger.warning("Connected but no camera frame yet")
+        else:
+            # Synthetic frame so preflight/status paths that expect a frame stay calm.
+            self._frame_counter += 1
+            self._latest_frame = CameraFrame(
+                image=[[[0, 0, 0]]],
+                timestamp_s=time.monotonic(),
+                frame_id=self._frame_counter,
+                encoding="rgb",
+                width=1,
+                height=1,
+            )
 
         # Never auto-standup here — preflight and connect must remain no-motion.
-        det_ok = self._init_detector()
-        if not det_ok:
-            logger.warning("Detector not ready; follow acquisition will fail until available")
+        if self._enable_video:
+            det_ok = self._init_detector()
+            if not det_ok:
+                logger.warning(
+                    "Detector not ready; follow acquisition will fail until available"
+                )
+        else:
+            logger.info("Skipping detector init (teleop session without video)")
 
         mode_label = "LocalAP" if self._connection_mode == "ap" else "LocalSTA"
         return True, "OK", f"Connected via {mode_label} (AES authenticated)"

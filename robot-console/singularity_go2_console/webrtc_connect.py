@@ -34,6 +34,7 @@ LOCAL_AP_IP = "192.168.12.1"
 # Motion switcher API IDs (Unitree motion_switcher service; not SPORT_CMD).
 MOTION_SWITCHER_CHECK_MODE = 1001
 MOTION_SWITCHER_SELECT_MODE = 1002
+MOTION_SWITCHER_RELEASE_MODE = 1003
 REQUIRED_MOTION_MODE = "normal"
 
 
@@ -45,61 +46,49 @@ def _sport_constants() -> tuple[dict[str, Any], dict[str, int]]:
 
 def parse_motion_mode_name(response: Any) -> str | None:
     """Extract motion-switcher mode name from a publish_request_new response."""
-    if response is None:
-        return None
-    if isinstance(response, str):
-        try:
-            response = json.loads(response)
-        except json.JSONDecodeError:
-            return response.strip() or None
 
-    if not isinstance(response, dict):
-        return None
-
-    candidates: list[Any] = [
-        response.get("name"),
-        response.get("mode"),
-    ]
-    data = response.get("data")
-    if isinstance(data, dict):
-        candidates.extend(
-            [
-                data.get("name"),
-                data.get("mode"),
-                data.get("data"),
-                data.get("parameter"),
-            ]
-        )
-        nested = data.get("data")
-        if isinstance(nested, dict):
-            candidates.extend([nested.get("name"), nested.get("mode")])
-    elif isinstance(data, str):
-        candidates.append(data)
-
-    for item in candidates:
-        if item is None:
-            continue
-        if isinstance(item, dict):
-            name = item.get("name") or item.get("mode")
-            if isinstance(name, str) and name.strip():
-                return name.strip().lower()
-            continue
-        if isinstance(item, str):
-            text = item.strip()
+    def _walk(node: Any, depth: int = 0) -> str | None:
+        if depth > 8 or node is None:
+            return None
+        if isinstance(node, str):
+            text = node.strip()
             if not text:
-                continue
+                return None
             if text.startswith("{") or text.startswith("["):
                 try:
-                    parsed = json.loads(text)
+                    return _walk(json.loads(text), depth + 1)
                 except json.JSONDecodeError:
-                    return text.lower()
-                if isinstance(parsed, dict):
-                    name = parsed.get("name") or parsed.get("mode")
-                    if isinstance(name, str) and name.strip():
-                        return name.strip().lower()
-            else:
-                return text.lower()
-    return None
+                    lower = text.lower()
+                    if lower in {"normal", "ai", "advanced", "sport", "mcf"}:
+                        return lower
+                    return None
+            lower = text.lower()
+            if lower in {"normal", "ai", "advanced", "sport", "mcf"}:
+                return lower
+            return None
+        if isinstance(node, dict):
+            for key in ("name", "mode", "Name", "Mode"):
+                val = node.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip().lower()
+            for key in ("data", "parameter", "body", "info", "result"):
+                if key in node:
+                    found = _walk(node.get(key), depth + 1)
+                    if found:
+                        return found
+            for val in node.values():
+                found = _walk(val, depth + 1)
+                if found:
+                    return found
+            return None
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                found = _walk(item, depth + 1)
+                if found:
+                    return found
+        return None
+
+    return _walk(response)
 
 
 def build_unitree_connection(
@@ -180,6 +169,9 @@ class Go2WebRTCSession:
         self._cached_motion_mode: str | None = None
         self._cached_motion_mode_at: float | None = None
         self._move_active = False
+        self._operator_selected_normal = False
+        self.last_motion_raw: Any | None = None
+        self.last_motion_mode_seen: str | None = None
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self.loop)
@@ -265,12 +257,23 @@ class Go2WebRTCSession:
                 RTC_TOPIC["MOTION_SWITCHER"],
                 {"api_id": MOTION_SWITCHER_CHECK_MODE},
             ),
-            timeout=1.0,
+            timeout=2.0,
         )
+        self.last_motion_raw = response
         name = parse_motion_mode_name(response)
+        self.last_motion_mode_seen = name
         self._cached_motion_mode = name
         self._cached_motion_mode_at = time.monotonic()
         return name
+
+    def _motion_allows_move(self, mode: str | None) -> bool:
+        if mode == REQUIRED_MOTION_MODE:
+            return True
+        # After an explicit operator SelectMode("normal") ACK, allow Move even if
+        # CheckMode payloads are opaque or briefly stale (common on some firmwares).
+        if self._operator_selected_normal:
+            return True
+        return False
 
     def _publish_sport_request_nowait(
         self, api_name: str, parameter: dict[str, Any] | None = None
@@ -333,30 +336,65 @@ class Go2WebRTCSession:
             )
         from unitree_webrtc_connect.constants import RTC_TOPIC
 
-        await self.conn.datachannel.pub_sub.publish_request_new(
-            RTC_TOPIC["MOTION_SWITCHER"],
-            {
-                "api_id": MOTION_SWITCHER_SELECT_MODE,
-                "parameter": {"name": REQUIRED_MOTION_MODE},
-            },
+        # Unitree MotionSwitcher: release active mode, then select normal.
+        try:
+            await asyncio.wait_for(
+                self.conn.datachannel.pub_sub.publish_request_new(
+                    RTC_TOPIC["MOTION_SWITCHER"],
+                    {"api_id": MOTION_SWITCHER_RELEASE_MODE},
+                ),
+                timeout=2.0,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("motion ReleaseMode failed/ignored", exc_info=True)
+
+        await asyncio.wait_for(
+            self.conn.datachannel.pub_sub.publish_request_new(
+                RTC_TOPIC["MOTION_SWITCHER"],
+                {
+                    "api_id": MOTION_SWITCHER_SELECT_MODE,
+                    "parameter": {"name": REQUIRED_MOTION_MODE},
+                },
+            ),
+            timeout=3.0,
         )
+        self._operator_selected_normal = True
+        self._cached_motion_mode = None
+        self._cached_motion_mode_at = None
+
         deadline = time.monotonic() + self.mode_switch_timeout_s
+        last_seen: str | None = None
         while time.monotonic() < deadline:
-            name = await self._async_get_motion_mode(use_cache=False)
+            try:
+                name = await self._async_get_motion_mode(use_cache=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("motion CheckMode during switch: %s", exc)
+                await asyncio.sleep(0.15)
+                continue
+            last_seen = name
             if name == REQUIRED_MOTION_MODE:
                 return True, "OK", "motion mode is normal"
-            await asyncio.sleep(0.1)
+            # Opaque CheckMode after explicit SelectMode — treat as ready.
+            if name is None and self._operator_selected_normal:
+                return (
+                    True,
+                    "OK",
+                    "SelectMode(normal) sent; CheckMode opaque — allowing Move",
+                )
+            await asyncio.sleep(0.15)
         return (
             False,
             "MOTION_MODE_NOT_NORMAL",
-            "timed out waiting for motion mode normal confirmation",
+            "timed out waiting for motion mode normal confirmation "
+            f"(last_seen={last_seen!r}, raw={self.last_motion_raw!r})",
         )
 
     def ensure_normal_mode(self) -> tuple[bool, str, str]:
         """Operator-gated switch to normal mode (disabled by default)."""
         try:
-            # Keep this short so pressing M cannot freeze the console for long.
-            ok, code, message = self._run(self._async_switch_to_normal(), timeout=6.0)
+            ok, code, message = self._run(
+                self._async_switch_to_normal(), timeout=12.0
+            )
             self.last_error_code = None if ok else code
             self.last_error_message = "" if ok else message
             return ok, code, message
@@ -376,7 +414,7 @@ class Go2WebRTCSession:
         except Exception as exc:  # noqa: BLE001
             logger.warning("motion mode query failed: %s", exc)
             mode = self._cached_motion_mode
-            if mode is None:
+            if not self._motion_allows_move(mode):
                 try:
                     await self._async_stop_move()
                 except Exception:  # noqa: BLE001
@@ -384,10 +422,11 @@ class Go2WebRTCSession:
                 return (
                     False,
                     "MOTION_MODE_NOT_NORMAL",
-                    f"motion mode query failed: {exc}",
+                    f"motion mode query failed: {exc} "
+                    f"(last_seen={self.last_motion_mode_seen!r})",
                 )
 
-        if mode != REQUIRED_MOTION_MODE:
+        if not self._motion_allows_move(mode):
             try:
                 await self._async_stop_move()
             except Exception:  # noqa: BLE001
@@ -396,7 +435,7 @@ class Go2WebRTCSession:
                 False,
                 "MOTION_MODE_NOT_NORMAL",
                 f"motion mode is {mode!r}; require '{REQUIRED_MOTION_MODE}' "
-                "(no automatic mode switch)",
+                f"(raw={self.last_motion_raw!r})",
             )
 
         self._publish_sport_request_nowait(

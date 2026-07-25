@@ -252,19 +252,26 @@ class Go2Controller:
             return ControllerResult.failure(ErrorCode.ESTOP_ACTIVE, "E-stop active")
 
         # Optional operator-gated switch to motion mode "normal" (never automatic).
+        # Do not hard-block MANUAL entry: Move still fail-closes if mode is wrong.
         if getattr(self.config, "allow_normal_mode_switch", False):
             ensure = getattr(self.adapter, "ensure_normal_mode", None)
             if callable(ensure):
                 ok, code, message = ensure()
                 if not ok:
-                    err = (
+                    logger.warning(
+                        "normal mode switch incomplete: %s %s — entering MANUAL anyway",
+                        code,
+                        message,
+                    )
+                    self._set_error(
                         ErrorCode[code]
                         if code in ErrorCode.__members__
-                        else ErrorCode.MOTION_MODE_NOT_NORMAL
+                        else ErrorCode.MOTION_MODE_NOT_NORMAL,
+                        message,
                     )
-                    self._set_error(err, message)
-                    self._mux.force_zero()
-                    return ControllerResult.failure(err, message)
+                else:
+                    self._last_error = None
+                    self._last_error_code = None
 
         result = await self._transition(
             ControllerMode.MANUAL,

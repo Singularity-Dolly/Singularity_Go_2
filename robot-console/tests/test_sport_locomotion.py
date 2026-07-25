@@ -40,6 +40,8 @@ class FakePubSub:
         self.requests.append(entry)
         if topic == RTC_TOPIC["MOTION_SWITCHER"] and api_id == MOTION_SWITCHER_CHECK_MODE:
             return {"data": {"data": json.dumps({"name": self.motion_mode, "form": "0"})}}
+        if topic == RTC_TOPIC["MOTION_SWITCHER"] and api_id == 1003:
+            return {"ok": True}
         if topic == RTC_TOPIC["MOTION_SWITCHER"] and api_id == MOTION_SWITCHER_SELECT_MODE:
             self.select_calls += 1
             param = options.get("parameter") or {}
@@ -97,6 +99,40 @@ def _session(
 def test_parse_motion_mode_name() -> None:
     assert parse_motion_mode_name({"data": {"data": '{"name":"ai"}'}}) == "ai"
     assert parse_motion_mode_name({"name": "normal"}) == "normal"
+    assert (
+        parse_motion_mode_name(
+            {
+                "type": "response",
+                "data": {
+                    "header": {"identity": {"api_id": 1001}},
+                    "data": {"name": "normal", "form": "0"},
+                },
+            }
+        )
+        == "normal"
+    )
+
+
+def test_opaque_checkmode_allows_move_after_select() -> None:
+    session, pub = _session(motion_mode="ai", allow_normal_mode_switch=True)
+
+    async def opaque_check(topic: str, options: dict[str, Any] | None = None):
+        options = options or {}
+        api_id = options.get("api_id")
+        pub.requests.append({"topic": topic, "options": options})
+        if api_id == MOTION_SWITCHER_SELECT_MODE:
+            pub.select_calls += 1
+            return {"ok": True}
+        if api_id == MOTION_SWITCHER_CHECK_MODE:
+            return {"data": {"header": {"status": {"code": 0}}, "data": ""}}
+        return {"ok": True}
+
+    pub.publish_request_new = opaque_check  # type: ignore[method-assign]
+    ok, code, _ = session.ensure_normal_mode()
+    assert ok is True
+    assert code == "OK"
+    assert session.move(0.1, 0.0, 0.0) is True
+    session.close()
 
 
 def test_w_produces_sport_move_positive_x() -> None:
@@ -263,9 +299,12 @@ async def test_start_manual_switch_requires_flag() -> None:
     ctl = Go2Controller(adapter, cfg, allow_mock=True)
     await ctl.connect("1.2.3.4")
     result = await ctl.start_manual()
-    assert result.ok is False
-    assert result.code == ErrorCode.MOTION_MODE_SWITCH_DISABLED
+    # Switch incomplete — still enter MANUAL; Move remains fail-closed.
+    assert result.ok is True
     assert adapter.mode_switch_calls == 1
+    move = await ctl.set_manual_velocity(0.1, 0.0, 0.0)
+    assert move.ok is False
+    assert move.code == ErrorCode.MOTION_MODE_NOT_NORMAL
 
 
 @pytest.mark.asyncio

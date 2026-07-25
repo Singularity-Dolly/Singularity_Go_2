@@ -351,6 +351,7 @@ class TerminalConsole:
             "  w/a/s/d = move (hold window ~400ms)\n"
             "  q/e     = strafe\n"
             "  x       = IDLE / stop\n"
+            "  mode    = show motion mode\n"
             "  space   = E-stop\n"
             "  i       = status\n"
             "  quit    = exit\n"
@@ -386,6 +387,16 @@ class TerminalConsole:
                 elif cmd == "x":
                     await self.handle_hold()
                     print("hold -> IDLE")
+                elif cmd == "mode":
+                    getter = getattr(self.controller.adapter, "get_motion_mode", None)
+                    if callable(getter):
+                        name, code, message = getter()
+                        raw = getattr(self.controller.adapter, "_session", None)
+                        raw_val = getattr(raw, "last_motion_raw", None) if raw else None
+                        print(f"motion_mode={name!r} code={code} {message}")
+                        print(f"raw={raw_val!r}")
+                    else:
+                        print("motion mode query not available on this adapter")
                 elif cmd == "i":
                     print((await self.controller.get_status()).to_dict())
                 elif cmd in MOTION_KEYS:

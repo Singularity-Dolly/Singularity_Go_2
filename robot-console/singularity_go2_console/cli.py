@@ -66,7 +66,9 @@ def _load_config(
     return cfg.with_overrides(**overrides)
 
 
-def _build_controller(cfg: Go2CtlConfig) -> Go2Controller:
+def _build_controller(
+    cfg: Go2CtlConfig, *, enable_video: bool = True
+) -> Go2Controller:
     if cfg.mock:
         from singularity_go2_console.testing.fakes import FakeGo2Adapter
 
@@ -80,6 +82,7 @@ def _build_controller(cfg: Go2CtlConfig) -> Go2Controller:
         connection_mode=cfg.connection_mode,
         aes_key=cfg.aes_key.value if cfg.aes_key else None,
         allow_normal_mode_switch=cfg.allow_normal_mode_switch,
+        enable_video=enable_video,
     )
     if adapter.mock:
         raise RuntimeError("Refusing mock adapter in real mode")
@@ -312,7 +315,9 @@ async def _start_session(
             return 2
 
     console.print("[yellow]Connecting… (wait for connected=True)[/yellow]")
-    controller = _build_controller(cfg)
+    # Console/manual teleop does not need camera/detector downloads.
+    want_video = (cfg.start_mode or "").lower() == "follow"
+    controller = _build_controller(cfg, enable_video=want_video)
     ip = cfg.robot_ip
     result = await controller.connect(ip)
     if not result.ok:
