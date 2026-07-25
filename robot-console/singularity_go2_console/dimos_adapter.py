@@ -589,42 +589,29 @@ class DimOSGo2Adapter:
             )
             self._warned_compat = True
 
+        edge_err: str | None = None
         try:
             from dimos.models.segmentation.edge_tam import EdgeTAMProcessor
             from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
             from dimos.navigation.visual_servoing.visual_servoing_2d import VisualServoing2D
-        except Exception as exc:  # noqa: BLE001
-            return False, "FOLLOW_SKILL_NOT_READY", f"Cannot import DimOS follow stack: {exc}"
 
-        self.stop_follow()
-        try:
+            self.stop_follow()
             import numpy as np
 
             tracker = EdgeTAMProcessor()
-            # Build Image for EdgeTAM
             image_obj = self._as_dimos_image(init.frame)
             box = np.array(init.bbox, dtype=np.float32)
             detections = tracker.init_track(image=image_obj, box=box, obj_id=1)
             if detections is None or len(detections) == 0:
-                self.publish_zero()
-                return False, "TRACKER_INIT_FAILED", "EdgeTAM failed to segment front person"
+                raise RuntimeError("EdgeTAM failed to segment front person")
 
-            try:
-                camera_info = CameraInfo.from_yaml(
-                    str(
-                        __import__("importlib.resources", fromlist=["files"]).files(
-                            "dimos.robot.unitree.go2"
-                        ).joinpath("front_camera_720.yaml")
-                    )
+            camera_info = CameraInfo.from_yaml(
+                str(
+                    __import__("importlib.resources", fromlist=["files"]).files(
+                        "dimos.robot.unitree.go2"
+                    ).joinpath("front_camera_720.yaml")
                 )
-            except Exception as exc:  # noqa: BLE001
-                self.publish_zero()
-                return (
-                    False,
-                    "FOLLOW_SKILL_NOT_READY",
-                    f"CameraInfo unavailable for VisualServoing2D: {exc}",
-                )
-
+            )
             self._visual_servo = VisualServoing2D(camera_info, False)
             self._tracker = tracker
             self._follow_stop.clear()
@@ -638,8 +625,98 @@ class DimOSGo2Adapter:
             self._follow_thread.start()
             return True, "OK", "EdgeTAM follow started"
         except Exception as exc:  # noqa: BLE001
+            edge_err = str(exc)
+            logger.warning(
+                "EdgeTAM follow unavailable (%s) — using YOLO bbox follow fallback",
+                edge_err,
+            )
+
+        # CPU-friendly fallback: re-detect person each frame and servo on bbox.
+        return self._start_yolo_bbox_follow(init, edge_err=edge_err)
+
+    def _start_yolo_bbox_follow(
+        self, init: FollowInit, *, edge_err: str | None = None
+    ) -> tuple[bool, str, str]:
+        if not self.detector_ready:
             self.publish_zero()
-            return False, "TRACKER_INIT_FAILED", str(exc)
+            return (
+                False,
+                "FOLLOW_SKILL_NOT_READY",
+                f"EdgeTAM failed ({edge_err}) and detector not ready for YOLO fallback",
+            )
+        self.stop_follow()
+        self._follow_stop.clear()
+        self._following = True
+        self._target_visible = True
+        self._visual_servo = None
+        self._tracker = None
+        width = int(init.frame.width or 640)
+        height = int(init.frame.height or 480)
+        self._follow_thread = threading.Thread(
+            target=self._yolo_follow_loop,
+            args=(width, height),
+            daemon=True,
+        )
+        self._follow_thread.start()
+        msg = "YOLO bbox follow started"
+        if edge_err:
+            msg += f" (EdgeTAM fallback: {edge_err})"
+        return True, "OK", msg
+
+    def _yolo_follow_loop(self, image_width: int, image_height: int) -> None:
+        """Simple person follow using YOLO detections (CPU OK)."""
+        period = 1.0 / self._control_hz
+        lost = 0
+        # Keep person roughly centered and at a comfortable size.
+        target_area = 0.12
+        kp_yaw = 1.2
+        kp_x = 0.8
+        while not self._follow_stop.is_set():
+            t0 = time.monotonic()
+            frame = self.get_latest_frame()
+            if frame is None or not self.detector_ready:
+                self._last_follow_cmd = (0.0, 0.0, 0.0)
+                lost += 1
+            else:
+                try:
+                    dets = self.detect_persons(frame)
+                    if not dets:
+                        self._last_follow_cmd = (0.0, 0.0, 0.0)
+                        self._target_visible = False
+                        lost += 1
+                        if lost > self._max_lost_frames:
+                            break
+                    else:
+                        lost = 0
+                        self._target_visible = True
+                        best = max(
+                            dets,
+                            key=lambda d: max(0.0, (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1])),
+                        )
+                        x1, y1, x2, y2 = best.bbox
+                        cx = 0.5 * (x1 + x2)
+                        area = max(0.0, (x2 - x1) * (y2 - y1)) / max(
+                            1.0, float(image_width * image_height)
+                        )
+                        err_x = (cx / max(1.0, float(image_width))) - 0.5
+                        wz = max(-0.35, min(0.35, -kp_yaw * err_x))
+                        # Closer (large bbox) → slow/back; far → forward.
+                        vx = max(-0.15, min(0.45, kp_x * (target_area - area)))
+                        if abs(err_x) > 0.25:
+                            vx *= 0.35  # turn first if far off-center
+                        self._last_follow_cmd = (float(vx), 0.0, float(wz))
+                except Exception:
+                    logger.exception("yolo follow loop error")
+                    self._last_follow_cmd = (0.0, 0.0, 0.0)
+                    lost += 1
+                    if lost > self._max_lost_frames:
+                        break
+            elapsed = time.monotonic() - t0
+            time.sleep(max(0.0, period - elapsed))
+
+        self._last_follow_cmd = (0.0, 0.0, 0.0)
+        self._following = False
+        self._target_visible = False
 
     def _as_dimos_image(self, frame: CameraFrame) -> Any:
         try:

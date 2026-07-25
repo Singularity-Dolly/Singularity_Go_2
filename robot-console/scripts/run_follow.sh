@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Physical front-person follow: YOLO + EdgeTAM + sport Move.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 if [[ -z "${VIRTUAL_ENV:-}" ]]; then
@@ -11,7 +12,11 @@ if [[ -z "${VIRTUAL_ENV:-}" ]]; then
   fi
 fi
 CONNECTION_MODE="${GO2CTL_CONNECTION_MODE:-ap}"
-ARGS=(--mode follow --connection-mode "${CONNECTION_MODE}")
+ARGS=(
+  follow
+  --connection-mode "${CONNECTION_MODE}"
+  --allow-normal-mode-switch
+)
 if [[ -n "${GO2CTL_AES_KEY_FILE:-}" ]]; then
   ARGS+=(--aes-key-file "${GO2CTL_AES_KEY_FILE}")
 elif [[ -f "${HOME}/.config/go2ctl/aes_key" ]]; then
@@ -20,4 +25,6 @@ fi
 if [[ -n "${ROBOT_IP:-}" ]]; then
   ARGS+=(--robot-ip "${ROBOT_IP}")
 fi
-exec go2ctl start "${ARGS[@]}" "$@"
+echo "Starting Go2 front-person follow…"
+echo "Stand in front of the camera. SPACE=estop  ESC=quit  X=hold"
+exec go2ctl "${ARGS[@]}" "$@"

@@ -461,12 +461,22 @@ def follow(
     aes_key_file: Optional[str] = typer.Option(None, "--aes-key-file"),
     mock: bool = typer.Option(False, "--mock"),
     allow_normal_mode_switch: bool = typer.Option(
+        True,
+        "--allow-normal-mode-switch/--no-allow-normal-mode-switch",
+        help="Arm normal mode + BalanceStand before follow (default: on)",
+    ),
+    line_mode: bool = typer.Option(
         False,
-        "--allow-normal-mode-switch",
-        help="Allow explicit switch to motion mode normal (disabled by default)",
+        "--line-mode",
+        help="Force line-mode console UI",
     ),
 ) -> None:
-    """Start automatic front-person follow."""
+    """Start automatic front-person follow (local YOLO + EdgeTAM AI)."""
+    console.print(SAFETY_WARNING)
+    console.print(
+        "Follow pipeline: camera → YOLO person detect → EdgeTAM track → walk follow.\n"
+        "Stand in front of the robot. SPACE = E-stop. ESC = quit."
+    )
     cfg = _load_config(
         robot_ip=robot_ip,
         mode="follow",
@@ -475,7 +485,9 @@ def follow(
         aes_key_file=aes_key_file,
         allow_normal_mode_switch=allow_normal_mode_switch,
     )
-    raise typer.Exit(asyncio.run(_start_session(cfg, open_console=True)))
+    raise typer.Exit(
+        asyncio.run(_start_session(cfg, open_console=True, line_mode=line_mode))
+    )
 
 
 @app.command()
