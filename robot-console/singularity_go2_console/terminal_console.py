@@ -1,13 +1,22 @@
-"""Terminal UI for go2ctl (curses primary, line-mode fallback). No Pygame window."""
+"""Terminal UI for go2ctl (curses primary, line-mode fallback). No Pygame window.
+
+WASD teleop uses a deadman hold window (GO2CTL_KEY_HOLD_MS) so a single key
+event keeps publishing at ~20 Hz until the deadline, then sends exactly one zero.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+import time
+from typing import Any, Callable
 
 from singularity_go2_console import SAFETY_WARNING
-from singularity_go2_console.config import Go2CtlConfig
+from singularity_go2_console.config import (
+    TELEOP_PUBLISH_HZ,
+    Go2CtlConfig,
+    clamp_key_hold_ms,
+)
 from singularity_go2_console.controller import Go2Controller
 from singularity_go2_console.state import ControllerMode
 
@@ -17,6 +26,9 @@ HELP = (
     "W/S forward/back  A/D turn  Q/E strafe | M manual  F follow  R reacquire  "
     "X hold  I status  L logs | SPACE estop  ESC quit | Ctrl=slow Shift=boost"
 )
+
+MOTION_KEYS = frozenset({"w", "a", "s", "d", "q", "e"})
+Clock = Callable[[], float]
 
 
 def _try_import_curses() -> Any | None:
@@ -29,15 +41,29 @@ def _try_import_curses() -> Any | None:
 
 
 class TerminalConsole:
-    def __init__(self, controller: Go2Controller, config: Go2CtlConfig) -> None:
+    def __init__(
+        self,
+        controller: Go2Controller,
+        config: Go2CtlConfig,
+        *,
+        clock: Clock | None = None,
+    ) -> None:
         self.controller = controller
         self.config = config
+        self._clock: Clock = clock or time.monotonic
         self._show_logs = False
-        self._keys_down: set[str] = set()
+        self._active_keys: set[str] = set()
+        self._active_vx = 0.0
+        self._active_vy = 0.0
+        self._active_wz = 0.0
+        self._active_until: float | None = None
+        self._need_zero = False
         self._slow = False
         self._boost = False
         self._running = True
         self._recent: list[str] = []
+        self._teleop_period_s = 1.0 / TELEOP_PUBLISH_HZ
+        self._last_teleop_publish_at: float | None = None
 
         def _on_event(event: Any) -> None:
             line = f"{event.type.value} {event.payload}"
@@ -45,6 +71,110 @@ class TerminalConsole:
             self._recent = self._recent[-30:]
 
         controller.subscribe(_on_event)
+
+    @property
+    def key_hold_ms(self) -> int:
+        return clamp_key_hold_ms(self.config.key_hold_ms)
+
+    @property
+    def is_active(self) -> bool:
+        return self._active_until is not None and self._clock() < self._active_until
+
+    def clear_active_vector(self) -> None:
+        """Drop the deadman vector without publishing (caller publishes zero)."""
+        self._active_keys.clear()
+        self._active_vx = 0.0
+        self._active_vy = 0.0
+        self._active_wz = 0.0
+        self._active_until = None
+        self._need_zero = False
+        self._last_teleop_publish_at = None
+        self._boost = False
+
+    def note_motion_key(self, key: str, *, boost: bool = False) -> None:
+        """Activate / extend deadman window for a motion key."""
+        k = key.lower()
+        if k not in MOTION_KEYS:
+            return
+        if boost:
+            self._boost = True
+        self._active_keys.add(k)
+        self._recompute_active_vector()
+        self._active_until = self._clock() + (self.key_hold_ms / 1000.0)
+        self._need_zero = False
+
+    def _recompute_active_vector(self) -> None:
+        cfg = self.config
+        vx = vy = wz = 0.0
+        if "w" in self._active_keys:
+            vx += cfg.max_forward_speed
+        if "s" in self._active_keys:
+            vx -= cfg.max_reverse_speed
+        if "q" in self._active_keys:
+            vy += cfg.max_strafe_speed
+        if "e" in self._active_keys:
+            vy -= cfg.max_strafe_speed
+        if "a" in self._active_keys:
+            wz += cfg.max_angular_speed
+        if "d" in self._active_keys:
+            wz -= cfg.max_angular_speed
+
+        mult = 1.0
+        if self._slow:
+            mult = cfg.slow_multiplier
+        elif self._boost:
+            mult = cfg.boost_multiplier
+
+        self._active_vx, self._active_vy, self._active_wz = cfg.clamp_velocity(
+            vx * mult, vy * mult, wz * mult
+        )
+
+    async def teleop_tick(self) -> None:
+        """20 Hz deadman publisher for MANUAL mode."""
+        mode = self.controller.mode
+        if mode != ControllerMode.MANUAL:
+            if self._active_until is not None or self._need_zero:
+                self.clear_active_vector()
+            return
+
+        now = self._clock()
+        if self._active_until is not None and now < self._active_until:
+            # Pace publishes at ~TELEOP_PUBLISH_HZ when the outer loop is faster.
+            if (
+                self._last_teleop_publish_at is not None
+                and (now - self._last_teleop_publish_at) < (self._teleop_period_s * 0.5)
+            ):
+                return
+            ttl = max(self.config.manual_ttl_ms, int(self._teleop_period_s * 1000) * 2)
+            result = await self.controller.set_manual_velocity(
+                self._active_vx,
+                self._active_vy,
+                self._active_wz,
+                ttl_ms=ttl,
+            )
+            if result.ok:
+                self._last_teleop_publish_at = now
+                self._need_zero = True
+            return
+
+        if self._need_zero or self._active_until is not None:
+            # Deadline expired (or force-clear path): exactly one zero.
+            await self.controller.set_manual_velocity(0.0, 0.0, 0.0, ttl_ms=self.config.manual_ttl_ms)
+            self.clear_active_vector()
+
+    async def handle_estop(self, reason: str = "space") -> None:
+        self.clear_active_vector()
+        await self.controller.emergency_stop(reason)
+
+    async def handle_hold(self) -> None:
+        self.clear_active_vector()
+        await self.controller.set_manual_velocity(0.0, 0.0, 0.0, ttl_ms=self.config.manual_ttl_ms)
+        await self.controller.hold()
+
+    async def handle_shutdown(self) -> None:
+        self.clear_active_vector()
+        await self.controller.set_manual_velocity(0.0, 0.0, 0.0, ttl_ms=self.config.manual_ttl_ms)
+        await self.controller.shutdown()
 
     async def run(self) -> int:
         curses = _try_import_curses()
@@ -55,6 +185,11 @@ class TerminalConsole:
             return await asyncio.to_thread(self._curses_main, curses)
         except Exception:
             logger.exception("curses UI failed; falling back to line mode")
+            self.clear_active_vector()
+            try:
+                await self.controller.set_manual_velocity(0.0, 0.0, 0.0)
+            except Exception:  # noqa: BLE001
+                logger.exception("zero during curses fallback failed")
             return await self._line_mode()
 
     def _curses_main(self, curses: Any) -> int:
@@ -63,17 +198,27 @@ class TerminalConsole:
     def _curses_loop(self, stdscr: Any, curses: Any) -> int:
         curses.curs_set(0)
         stdscr.nodelay(True)
-        stdscr.timeout(50)
+        # ~20 Hz teleop cadence
+        stdscr.timeout(int(1000 / TELEOP_PUBLISH_HZ))
         loop = asyncio.new_event_loop()
         try:
             while self._running:
                 self._handle_keys(stdscr, loop)
                 loop.run_until_complete(self.controller.tick_watchdogs())
-                if self.controller.mode == ControllerMode.MANUAL:
-                    loop.run_until_complete(self._publish_held_keys())
+                loop.run_until_complete(self.teleop_tick())
                 self._draw(stdscr, loop, curses)
+        except Exception:
+            logger.exception("console loop crashed; forcing zero")
+            try:
+                loop.run_until_complete(self.handle_shutdown())
+            except Exception:  # noqa: BLE001
+                logger.exception("shutdown after crash failed")
+            raise
         finally:
-            loop.run_until_complete(self.controller.shutdown())
+            try:
+                loop.run_until_complete(self.handle_shutdown())
+            except Exception:  # noqa: BLE001
+                logger.exception("final shutdown failed")
             loop.close()
         return 0
 
@@ -88,10 +233,10 @@ class TerminalConsole:
             key = ch
             if key == 27:  # ESC
                 self._running = False
+                loop.run_until_complete(self.handle_shutdown())
                 return
             if key == ord(" "):
-                loop.run_until_complete(self.controller.emergency_stop("space"))
-                self._keys_down.clear()
+                loop.run_until_complete(self.handle_estop("space"))
                 continue
 
             char = chr(key) if 0 <= key < 256 else ""
@@ -103,7 +248,7 @@ class TerminalConsole:
             elif char.lower() == "r":
                 loop.run_until_complete(self.controller.reacquire_front_person())
             elif char.lower() == "x":
-                loop.run_until_complete(self.controller.hold())
+                loop.run_until_complete(self.handle_hold())
             elif char.lower() == "i":
                 status = loop.run_until_complete(self.controller.get_status())
                 self._recent.append(str(status.to_dict()))
@@ -111,45 +256,23 @@ class TerminalConsole:
                 self._show_logs = not self._show_logs
             elif char == "[":
                 self._slow = not self._slow
+                if self._active_keys:
+                    self._recompute_active_vector()
             elif char == "]":
                 self._boost = not self._boost
-            elif char.lower() in {"w", "a", "s", "d", "q", "e"}:
-                self._boost = char.isupper()
-                self._keys_down.add(char.lower())
-
-    async def _publish_held_keys(self) -> None:
-        if not self._keys_down:
-            return
-        vx = vy = wz = 0.0
-        cfg = self.config
-        if "w" in self._keys_down:
-            vx += cfg.max_forward_speed
-        if "s" in self._keys_down:
-            vx -= cfg.max_reverse_speed
-        if "q" in self._keys_down:
-            vy += cfg.max_strafe_speed
-        if "e" in self._keys_down:
-            vy -= cfg.max_strafe_speed
-        if "a" in self._keys_down:
-            wz += cfg.max_angular_speed
-        if "d" in self._keys_down:
-            wz -= cfg.max_angular_speed
-
-        mult = 1.0
-        if self._slow:
-            mult = cfg.slow_multiplier
-        elif self._boost:
-            mult = cfg.boost_multiplier
-
-        vx, vy, wz = cfg.clamp_velocity(vx * mult, vy * mult, wz * mult)
-        vx, vy, wz = cfg.clamp_velocity(vx, vy, wz)
-        await self.controller.set_manual_velocity(vx, vy, wz, cfg.manual_ttl_ms)
-        self._keys_down.clear()
-        self._boost = False
+                if self._active_keys:
+                    self._recompute_active_vector()
+            elif char.lower() in MOTION_KEYS:
+                if self.controller.mode != ControllerMode.MANUAL:
+                    loop.run_until_complete(self.controller.start_manual())
+                self.note_motion_key(char.lower(), boost=char.isupper())
 
     def _draw(self, stdscr: Any, loop: asyncio.AbstractEventLoop, curses: Any) -> None:
         stdscr.erase()
         status = loop.run_until_complete(self.controller.get_status())
+        hold_left_ms = 0
+        if self._active_until is not None:
+            hold_left_ms = max(0, int((self._active_until - self._clock()) * 1000))
         rows = [
             "go2ctl — Unitree Go2 Console",
             SAFETY_WARNING,
@@ -163,7 +286,8 @@ class TerminalConsole:
             f"wdog manual={status.manual_watchdog_ok} camera={status.camera_watchdog_ok} "
             f"conn={status.connection_watchdog_ok}",
             f"last_command={status.last_command}  last_error={status.last_error}",
-            f"slow={self._slow} boost={self._boost} mock={status.mock}",
+            f"slow={self._slow} boost={self._boost} mock={status.mock} "
+            f"hold_ms={self.key_hold_ms} hold_left_ms={hold_left_ms} keys={sorted(self._active_keys)}",
             "",
             HELP,
             "",
@@ -190,41 +314,53 @@ class TerminalConsole:
     async def _line_mode(self) -> int:
         print(SAFETY_WARNING)
         print(HELP)
-        print("Line mode: type commands: w/a/s/d/q/e, m, f, r, x, i, l, space, quit")
-        while self._running:
-            await self.controller.tick_watchdogs()
-            status = await self.controller.get_status()
-            print(
-                f"[{status.mode}] owner={status.velocity_owner} "
-                f"vx={status.vx:.2f} wz={status.wz:.2f} err={status.last_error}"
-            )
-            try:
-                line = await asyncio.to_thread(input, "> ")
-            except EOFError:
-                break
-            cmd = line.strip().lower()
-            if cmd in {"quit", "esc", "exit"}:
-                break
-            if cmd in {"space", "estop"}:
-                await self.controller.emergency_stop("line")
-            elif cmd == "m":
-                await self.controller.start_manual()
-            elif cmd == "f":
-                await self.controller.start_follow_front_person()
-            elif cmd == "r":
-                await self.controller.reacquire_front_person()
-            elif cmd == "x":
-                await self.controller.hold()
-            elif cmd == "i":
-                print((await self.controller.get_status()).to_dict())
-            elif cmd in {"w", "a", "s", "d", "q", "e"}:
-                await self.controller.start_manual()
-                self._keys_down = {cmd}
-                await self._publish_held_keys()
-            else:
-                print("unknown command")
-            await asyncio.sleep(0.05)
-        await self.controller.shutdown()
+        print(
+            "Line mode: type commands: w/a/s/d/q/e, m, f, r, x, i, l, space, quit\n"
+            f"Deadman hold window: {self.key_hold_ms} ms @ {TELEOP_PUBLISH_HZ:.0f} Hz"
+        )
+        try:
+            while self._running:
+                await self.controller.tick_watchdogs()
+                await self.teleop_tick()
+                status = await self.controller.get_status()
+                print(
+                    f"[{status.mode}] owner={status.velocity_owner} "
+                    f"vx={status.vx:.2f} wz={status.wz:.2f} err={status.last_error}"
+                )
+                try:
+                    line = await asyncio.to_thread(input, "> ")
+                except EOFError:
+                    break
+                cmd = line.strip().lower()
+                if cmd in {"quit", "esc", "exit"}:
+                    break
+                if cmd in {"space", "estop"}:
+                    await self.handle_estop("line")
+                elif cmd == "m":
+                    await self.controller.start_manual()
+                elif cmd == "f":
+                    await self.controller.start_follow_front_person()
+                elif cmd == "r":
+                    await self.controller.reacquire_front_person()
+                elif cmd == "x":
+                    await self.handle_hold()
+                elif cmd == "i":
+                    print((await self.controller.get_status()).to_dict())
+                elif cmd in MOTION_KEYS:
+                    if self.controller.mode != ControllerMode.MANUAL:
+                        await self.controller.start_manual()
+                    self.note_motion_key(cmd)
+                    # Drain the hold window with teleop ticks (mock/tests/line mode).
+                    while self.is_active:
+                        await self.teleop_tick()
+                        await self.controller.tick_watchdogs()
+                        await asyncio.sleep(self._teleop_period_s)
+                    await self.teleop_tick()
+                else:
+                    print("unknown command")
+                await asyncio.sleep(0.05)
+        finally:
+            await self.handle_shutdown()
         return 0
 
 
